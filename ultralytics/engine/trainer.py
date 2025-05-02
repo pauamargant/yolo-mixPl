@@ -468,7 +468,7 @@ class BaseTrainer:
                     if target_batch_data:
                         batch['target_batch_data'] = target_batch_data
 
-                    loss, self.loss_items = self.model(batch)
+                    supervised_loss, self.loss_items = self.model(batch)
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size
@@ -494,7 +494,10 @@ class BaseTrainer:
 
 
                 # Backward
-                self.scaler.scale(self.loss).backward()
+                # 4. Combine losses and backpropagate
+                total_loss = supervised_loss + 0.5 * unsupervised_loss
+                self.scaler.scale(total_loss).backward()
+                # self.scaler.scale(self.loss).backward()
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
