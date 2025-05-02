@@ -483,14 +483,16 @@ class BaseTrainer:
                     pseudo_labels = target_batch_data.get('pseudo_labels', None)
 
                 if pseudo_labels is not None and len(pseudo_labels):
-                    # build a minimal “unlabeled” batch dict that YOLO expects
+                    # build a batch dict with the structure expected by the loss function
                     ulb_batch = {
-                        'img': target_batch_data['img'],      # (B_unlabeled, C, H, W)
-                        'labels': pseudo_labels               # (M, 6) tensor of [batch_idx, cls, x, y, w, h]
+                        'img': target_batch_data['img'],                   # (B_unlabeled, C, H, W)
+                        'batch_idx': pseudo_labels[:, 0],                  # (M,) tensor of batch indices
+                        'cls': pseudo_labels[:, 1],                        # (M,) tensor of class indices
+                        'bboxes': pseudo_labels[:, 2:],                    # (M, 4) tensor of bounding boxes [xywhn]
+                        # Add other keys if the specific loss function requires them, e.g., masks, keypoints
                     }
                     with autocast(self.amp):
                         unsup_loss_tensor, unsup_loss_items = self.model(ulb_batch)
-                    unsupervised_loss = unsup_loss_tensor.sum()
 
 
                 # Backward
@@ -559,7 +561,6 @@ class BaseTrainer:
                             LOGGER.info("Validating Teacher model on Target dataset...")
                             original_dataloader = self.validator.dataloader
                             self.validator.dataloader = self.target_test_loader
-                            teacher_tgt_metrics = self.validator(model=self.teacher_ema.ema)
                             teacher_metrics["teacher/tgt_precision"] = teacher_tgt_metrics.get('metrics/precision(B)', 0)
                             teacher_metrics["teacher/tgt_recall"] = teacher_tgt_metrics.get('metrics/recall(B)', 0)
                             teacher_metrics["teacher/tgt_map50-95"] = teacher_tgt_metrics.get('metrics/mAP50-95(B)', 0)
