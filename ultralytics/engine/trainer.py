@@ -41,7 +41,7 @@ from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
-from ultralytics.utils.ops import xyxy2xywhn
+from ultralytics.utils.ops import xyxy2xywhn, non_max_suppression
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
@@ -373,6 +373,11 @@ class BaseTrainer:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
 
+        # Add default pseudo-label thresholds if not in args
+        self.args.pseudo_label_conf_thres = getattr(self.args, 'pseudo_label_conf', 0.4)  # Example threshold
+        self.args.nms_conf_thres = getattr(self.args, 'nms_conf', 0.25)  # Standard NMS conf
+        self.args.nms_iou_thres = getattr(self.args, 'nms_iou', 0.45)  # Standard NMS IoU
+
         nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
         last_opt_step = -1
@@ -441,10 +446,21 @@ class BaseTrainer:
                     target_batch = self.preprocess_batch(target_batch)
                     with torch.no_grad():
                         teacher = self.teacher_ema.ema.to(self.device).eval()
-                        teacher_preds = teacher(target_batch['img'])
+                        teacher_preds_raw = teacher(target_batch['img'])  # Get raw predictions
+
+                        # Format predictions into pseudo-labels
+                        pseudo_labels = self._format_pseudo_labels(
+                            preds_raw=teacher_preds_raw,
+                            batch=target_batch,
+                            conf_thres=self.args.nms_conf_thres,  # Use standard NMS confidence
+                            iou_thres=self.args.nms_iou_thres,    # Use standard NMS IoU
+                            pseudo_label_conf_thres=self.args.pseudo_label_conf_thres  # Specific threshold for pseudo-labels
+                        )
+
                         target_batch_data = {
                             'img': target_batch['img'],
-                            'teacher_preds': teacher_preds
+                            'teacher_preds_raw': teacher_preds_raw,  # Keep raw preds if needed elsewhere
+                            'pseudo_labels': pseudo_labels  # Store formatted labels
                         }
                 # --- End Pseudo-Label Generation ---
 
@@ -580,6 +596,58 @@ class BaseTrainer:
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
+
+    def _format_pseudo_labels(self, preds_raw, batch, conf_thres, iou_thres, pseudo_label_conf_thres):
+        """
+        Formats raw teacher predictions into pseudo-labels for detection.
+
+        Applies NMS and filters based on a pseudo-label confidence threshold.
+
+        Args:
+            preds_raw (list | torch.Tensor): Raw predictions from the teacher model (before NMS).
+            batch (dict): The target batch dictionary (must contain 'img' and 'batch_idx').
+            conf_thres (float): Confidence threshold for NMS.
+            iou_thres (float): IoU threshold for NMS.
+            pseudo_label_conf_thres (float): Confidence threshold specifically for filtering pseudo-labels.
+
+        Returns:
+            (torch.Tensor | None): Formatted pseudo-labels in [batch_idx, cls, xywhn] format, or None.
+        """
+        formatted_labels = []
+        img_idx = batch.get('batch_idx')
+        if img_idx is None:
+            LOGGER.warning("Batch index ('batch_idx') not found in target batch for pseudo-label formatting.")
+            return None
+        img_h, img_w = batch['img'].shape[2:]  # Assuming H, W
+
+        # Apply NMS
+        preds_nms = non_max_suppression(preds_raw,
+                                        conf_thres=conf_thres,
+                                        iou_thres=iou_thres,
+                                        multi_label=False,
+                                        max_det=300)
+
+        # Iterate through NMS results per image
+        for si, pred in enumerate(preds_nms):
+            if pred is None or len(pred) == 0:
+                continue
+
+            # Filter by the specific pseudo-label confidence threshold
+            pred = pred[pred[:, 4] >= pseudo_label_conf_thres]
+            if len(pred) == 0:
+                continue
+
+            # Create labels tensor [batch_idx, cls, xywhn]
+            batch_idx_tensor = torch.full((pred.shape[0], 1), img_idx[si], device=self.device, dtype=pred.dtype)
+            cls_tensor = pred[:, 5:6]  # Class index is the 6th element
+            xywhn_tensor = xyxy2xywhn(pred[:, :4], w=img_w, h=img_h, clip=True)  # Bbox is the first 4 elements
+
+            formatted_labels.append(torch.cat((batch_idx_tensor, cls_tensor, xywhn_tensor), dim=1))
+
+        if not formatted_labels:
+            return None
+
+        return torch.cat(formatted_labels, 0)
 
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""
