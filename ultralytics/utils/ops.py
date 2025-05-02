@@ -231,6 +231,11 @@ def non_max_suppression(
     """
     import torchvision  # scope for faster 'import ultralytics'
 
+    # Cast thresholds to float early to handle potential string inputs from configs/checkpoints
+    # Use a sensible default like 0.0 if None is passed, although NMS usually expects a value.
+    conf_thres = float(conf_thres) if conf_thres is not None else 0.0
+    iou_thres = float(iou_thres) if iou_thres is not None else 0.0
+
     # Checks
     assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"

@@ -375,7 +375,6 @@ class BaseTrainer:
 
         # Add default pseudo-label thresholds if not in args
         self.args.pseudo_label_conf_thres = getattr(self.args, 'pseudo_label_conf', 0.4)  # Example threshold
-        self.args.nms_conf_thres = getattr(self.args, 'nms_conf', 0.25)  # Standard NMS conf
         self.args.nms_iou_thres = getattr(self.args, 'nms_iou', 0.45)  # Standard NMS IoU
 
         nb = len(self.train_loader)  # number of batches
@@ -448,13 +447,12 @@ class BaseTrainer:
                         teacher = self.teacher_ema.ema.to(self.device).eval()
                         teacher_preds_raw = teacher(target_batch['img'])  # Get raw predictions
 
-                        # Format predictions into pseudo-labels
+                        # Format predictions into pseudo-labels using the pseudo-label threshold for NMS
                         pseudo_labels = self._format_pseudo_labels(
                             preds_raw=teacher_preds_raw,
                             batch=target_batch,
-                            conf_thres=self.args.nms_conf_thres,  # Use standard NMS confidence
-                            iou_thres=self.args.nms_iou_thres,    # Use standard NMS IoU
-                            pseudo_label_conf_thres=self.args.pseudo_label_conf_thres  # Specific threshold for pseudo-labels
+                            conf_thres=self.args.pseudo_label_conf_thres,  # Use pseudo-label threshold directly for NMS
+                            iou_thres=self.args.nms_iou_thres
                         )
 
                         target_batch_data = {
@@ -597,18 +595,17 @@ class BaseTrainer:
         unset_deterministic()
         self.run_callbacks("teardown")
 
-    def _format_pseudo_labels(self, preds_raw, batch, conf_thres, iou_thres, pseudo_label_conf_thres):
+    def _format_pseudo_labels(self, preds_raw, batch, conf_thres, iou_thres):
         """
         Formats raw teacher predictions into pseudo-labels for detection.
 
-        Applies NMS and filters based on a pseudo-label confidence threshold.
+        Applies NMS using the provided confidence and IoU thresholds.
 
         Args:
             preds_raw (list | torch.Tensor): Raw predictions from the teacher model (before NMS).
             batch (dict): The target batch dictionary (must contain 'img' and 'batch_idx').
-            conf_thres (float): Confidence threshold for NMS.
+            conf_thres (float): Confidence threshold for NMS (used directly from pseudo_label_conf_thres).
             iou_thres (float): IoU threshold for NMS.
-            pseudo_label_conf_thres (float): Confidence threshold specifically for filtering pseudo-labels.
 
         Returns:
             (torch.Tensor | None): Formatted pseudo-labels in [batch_idx, cls, xywhn] format, or None.
@@ -620,7 +617,7 @@ class BaseTrainer:
             return None
         img_h, img_w = batch['img'].shape[2:]  # Assuming H, W
 
-        # Apply NMS
+        # Apply NMS using the provided confidence threshold (originally pseudo_label_conf_thres)
         preds_nms = non_max_suppression(preds_raw,
                                         conf_thres=conf_thres,
                                         iou_thres=iou_thres,
@@ -630,11 +627,6 @@ class BaseTrainer:
         # Iterate through NMS results per image
         for si, pred in enumerate(preds_nms):
             if pred is None or len(pred) == 0:
-                continue
-
-            # Filter by the specific pseudo-label confidence threshold
-            pred = pred[pred[:, 4] >= pseudo_label_conf_thres]
-            if len(pred) == 0:
                 continue
 
             # Create labels tensor [batch_idx, cls, xywhn]
