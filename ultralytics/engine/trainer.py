@@ -469,7 +469,7 @@ class BaseTrainer:
                         batch['target_batch_data'] = target_batch_data
 
                     supervised_loss, self.loss_items = self.model(batch)
-                    self.loss = loss.sum()
+                    self.loss = supervised_loss.sum()
                     if RANK != -1:
                         self.loss *= world_size
                     self.tloss = (
