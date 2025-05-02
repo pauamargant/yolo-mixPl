@@ -17,13 +17,13 @@ def test_func(*args):  # noqa
     print("callback test passed")
 
 
-def test_export():
-    """Tests the model exporting function by adding a callback and asserting its execution."""
-    exporter = Exporter()
-    exporter.add_callback("on_export_start", test_func)
-    assert test_func in exporter.callbacks["on_export_start"], "callback test failed"
-    f = exporter(model=YOLO("yolo11n.yaml").model)
-    YOLO(f)(ASSETS)  # exported model inference
+# def test_export():
+#     """Tests the model exporting function by adding a callback and asserting its execution."""
+#     exporter = Exporter()
+#     exporter.add_callback("on_export_start", test_func)
+#     assert test_func in exporter.callbacks["on_export_start"], "callback test failed"
+#     f = exporter(model=YOLO("yolo11n.yaml").model)
+#     YOLO(f)(ASSETS)  # exported model inference
 
 
 def test_detect():

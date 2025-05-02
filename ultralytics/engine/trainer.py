@@ -139,7 +139,6 @@ class BaseTrainer:
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
 
         # Teacher-Student Framework attributes
-        self.teacher_model = None
         self.teacher_ema = None
         self.args.teacher_ema_decay = getattr(self.args, 'teacher_ema_decay', 0.9998)
 
@@ -322,13 +321,10 @@ class BaseTrainer:
 
             # --- Teacher Model Setup ---
             LOGGER.info(f"Setting up Teacher model with EMA decay {self.args.teacher_ema_decay}...")
-            self.teacher_model = deepcopy(self.model).eval()
-            for param in self.teacher_model.parameters():
-                param.requires_grad = False
-            self.teacher_ema = ModelEMA(self.teacher_model, decay=self.args.teacher_ema_decay)
+            self.teacher_ema = ModelEMA(self.model, decay=self.args.teacher_ema_decay)
             
-            self.teacher_ema.ema = deepcopy(self.model).eval()
-            self.teacher_ema.updates = 0
+            # self.teacher_ema.ema.eval()
+            # self.teacher_ema.updates = 0
             # --- End Teacher Model Setup ---
 
             if self.args.plots:
@@ -374,8 +370,8 @@ class BaseTrainer:
         self._setup_train(world_size)
 
         # Add default pseudo-label thresholds if not in args
-        self.args.pseudo_label_conf_thres = getattr(self.args, 'pseudo_label_conf', 0.4)  # Example threshold
-        self.args.nms_iou_thres = getattr(self.args, 'nms_iou', 0.45)  # Standard NMS IoU
+        self.args.pseudo_label_conf = getattr(self.args, 'pseudo_label_conf', 0.4)  # Example threshold
+        self.args.nms_iou = getattr(self.args, 'nms_iou', 0.45)  # Standard NMS IoU
 
         nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
@@ -443,6 +439,8 @@ class BaseTrainer:
                         target_batch = next(self.target_train_loader_iter)
 
                     target_batch = self.preprocess_batch(target_batch)
+                    B = target_batch['img'].shape[0]
+                    target_batch['batch_idx'] = torch.arange(B, device=self.device)
                     with torch.no_grad():
                         teacher = self.teacher_ema.ema.to(self.device).eval()
                         teacher_preds_raw = teacher(target_batch['img'])  # Get raw predictions
@@ -451,14 +449,16 @@ class BaseTrainer:
                         pseudo_labels = self._format_pseudo_labels(
                             preds_raw=teacher_preds_raw,
                             batch=target_batch,
-                            conf_thres=self.args.pseudo_label_conf_thres,  # Use pseudo-label threshold directly for NMS
-                            iou_thres=self.args.nms_iou_thres
+                            conf_thres=self.args.pseudo_label_conf,  # Use pseudo-label threshold directly for NMS
+                            iou_thres=self.args.nms_iou
                         )
 
+                        B = target_batch['img'].shape[0]
                         target_batch_data = {
                             'img': target_batch['img'],
                             'teacher_preds_raw': teacher_preds_raw,  # Keep raw preds if needed elsewhere
-                            'pseudo_labels': pseudo_labels  # Store formatted labels
+                            'pseudo_labels': pseudo_labels,
+                        
                         }
                 # --- End Pseudo-Label Generation ---
 
@@ -469,15 +469,15 @@ class BaseTrainer:
                         batch['target_batch_data'] = target_batch_data
 
                     supervised_loss, self.loss_items = self.model(batch)
-                    self.loss = supervised_loss.sum()
+                    self.supervised_loss = supervised_loss.sum()
                     if RANK != -1:
-                        self.loss *= world_size
+                        self.supervised_loss *= world_size
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
                                 
                 # 2. Unsupervised loss on pseudo-labeled data
-                unsupervised_loss = torch.tensor(0.0, device=self.device)
+                self.unsupervised_loss = torch.tensor(0.0, device=self.device)
                 pseudo_labels = None
                 if target_batch_data is not None:
                     pseudo_labels = target_batch_data.get('pseudo_labels', None)
@@ -492,13 +492,14 @@ class BaseTrainer:
                         # Add other keys if the specific loss function requires them, e.g., masks, keypoints
                     }
                     with autocast(self.amp):
-                        unsup_loss_tensor, unsup_loss_items = self.model(ulb_batch)
+                        unsupervised_loss, unsup_loss_items = self.model(ulb_batch)
+                        self.unsupervised_loss = unsupervised_loss.sum()
 
 
                 # Backward
                 # 4. Combine losses and backpropagate
-                total_loss = supervised_loss + 0.5 * unsupervised_loss
-                self.scaler.scale(total_loss).backward()
+                self.loss = self.supervised_loss + 0.5 * self.unsupervised_loss
+                self.scaler.scale(self.loss).backward()
                 # self.scaler.scale(self.loss).backward()
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
@@ -561,6 +562,7 @@ class BaseTrainer:
                             LOGGER.info("Validating Teacher model on Target dataset...")
                             original_dataloader = self.validator.dataloader
                             self.validator.dataloader = self.target_test_loader
+                            teacher_tgt_metrics = self.validator(model=self.teacher_ema.ema)
                             teacher_metrics["teacher/tgt_precision"] = teacher_tgt_metrics.get('metrics/precision(B)', 0)
                             teacher_metrics["teacher/tgt_recall"] = teacher_tgt_metrics.get('metrics/recall(B)', 0)
                             teacher_metrics["teacher/tgt_map50-95"] = teacher_tgt_metrics.get('metrics/mAP50-95(B)', 0)
@@ -625,7 +627,7 @@ class BaseTrainer:
         Args:
             preds_raw (list | torch.Tensor): Raw predictions from the teacher model (before NMS).
             batch (dict): The target batch dictionary (must contain 'img' and 'batch_idx').
-            conf_thres (float): Confidence threshold for NMS (used directly from pseudo_label_conf_thres).
+            conf_thres (float): Confidence threshold for NMS (used directly from pseudo_label_conf).
             iou_thres (float): IoU threshold for NMS.
 
         Returns:
@@ -838,11 +840,18 @@ class BaseTrainer:
         self.optimizer.zero_grad()
         if self.ema:
             self.ema.update(self.model.module if hasattr(self.model, 'module') else self.model)
-
+        # # Debug logs for teacher model and self.model
+        # if RANK in {-1, 0}:  # Only log on main process
+        #     if self.teacher_ema:
+        #         print("Teacher Model Keys: ", list(self.teacher_ema.ema.state_dict().keys()))
+        #         print("Student Model Keys: ", list(self.model.state_dict().keys()))
+        #         LOGGER.warning(f"Teacher EMA Model Keys: {list(self.teacher_ema.ema.state_dict().keys())}")
+        #         LOGGER.warning(f"Student Model Keys: {list(self.model.state_dict().keys())}")
         # --- Teacher EMA Update ---
         if self.teacher_ema and RANK in {-1, 0}:  # Update teacher only on main process
-            student_model_state = self.model.module if hasattr(self.model, 'module') else self.model
-            self.teacher_ema.update(student_model_state)
+            self.teacher_ema.update(
+                self.model.module if hasattr(self.model, 'module') else self.model
+            )
         # --- End Teacher EMA Update ---
 
     def preprocess_batch(self, batch):
@@ -995,9 +1004,13 @@ class BaseTrainer:
             self.teacher_ema.ema.load_state_dict(ckpt["teacher_ema"].float().state_dict())
             self.teacher_ema.updates = ckpt.get("teacher_updates", self.teacher_ema.updates)
         elif hasattr(self, 'teacher_ema') and self.teacher_ema:
-            LOGGER.warning("Resuming from checkpoint without teacher EMA state. Re-initializing teacher EMA from current student EMA.")
-            self.teacher_ema.ema.load_state_dict(self.ema.ema.float().state_dict())
-            self.teacher_ema.updates = self.ema.updates
+            LOGGER.warning("Resuming from checkpoint without teacher EMA state. Re-initializing teacher EMA from current student model.")
+            self.teacher_ema = ModelEMA(
+                self.model.module if hasattr(self.model, 'module') else self.model,
+                decay=self.args.teacher_ema_decay,
+                updates=0,
+            )
+
         # --- End Teacher EMA Resume ---
 
         assert start_epoch > 0, (
