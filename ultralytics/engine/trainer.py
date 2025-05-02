@@ -462,25 +462,22 @@ class BaseTrainer:
                         }
                 # --- End Pseudo-Label Generation ---
 
-                # 1) Supervised on *source* batch
-                batch = self.preprocess_batch(batch)
-                imgs_s, labels = batch['img'], batch['labels']
+                # Forward pass with student model on source batch
                 with autocast(self.amp):
-                    preds_s = self.model(imgs_s)
-                    Ls, sup_items = self.compute_loss(preds_s, labels)
+                    batch = self.preprocess_batch(batch)
+                    if target_batch_data:
+                        batch['target_batch_data'] = target_batch_data
 
-                # 2) Unsupervised on *target* (strong) batch
-                tb = target_batch_data
-                # assume tb['img'] is already your *strong* view
-                with autocast(self.amp):
-                    preds_u = self.model(tb['img'])
-                    Lu, unsup_items = self.compute_loss(preds_u, tb['pseudo_labels'])
+                    loss, self.loss_items = self.model(batch)
+                    self.loss = loss.sum()
+                    if RANK != -1:
+                        self.loss *= world_size
+                    self.tloss = (
+                        (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
+                    )
 
-                # 3) Combine & backward
-                total = Ls + self.args.unsup_weight * Lu
-                self.scaler.scale(total).backward()
-                self.loss = total  # for logging
-                self.loss_items = torch.cat([sup_items, unsup_items], dim=0)
+                # Backward
+                self.scaler.scale(self.loss).backward()
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
