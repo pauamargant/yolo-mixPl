@@ -21,11 +21,6 @@ import torch
 from torch import distributed as dist
 from torch import nn, optim
 
-import albumentations as A
-import cv2
-from ultralytics.utils.ops import xywhn2xyxy, xyxy2xywhn
-from ultralytics.utils import LOGGER, colorstr
-
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
@@ -33,10 +28,12 @@ from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
 from ultralytics.utils import (
     DEFAULT_CFG,
     LOCAL_RANK,
+    LOGGER,
     RANK,
     TQDM,
     callbacks,
     clean_url,
+    colorstr,
     emojis,
     yaml_save,
 )
@@ -44,7 +41,7 @@ from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
-from ultralytics.utils.ops import non_max_suppression
+from ultralytics.utils.ops import xyxy2xywhn, non_max_suppression
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
@@ -176,10 +173,6 @@ class BaseTrainer:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
         if RANK in {-1, 0}:
             callbacks.add_integration_callbacks(self)
-
-        # Strong Augmentation
-        self.args.strong_augment = getattr(self.args, 'strong_augment', False)  # Add config flag
-        self.strong_augment_pipeline = None  # Initialize pipeline attribute
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""
@@ -374,142 +367,15 @@ class BaseTrainer:
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks("on_pretrain_routine_end")
 
-        # Build strong augmentation pipeline if enabled (only on rank 0/-1 as it's used there)
-        if RANK in {-1, 0} and self.args.strong_augment:
-            LOGGER.info(f"{colorstr('Strong Augment:')} Enabling strong augmentations for target domain.")
-            self.strong_augment_pipeline = self._build_strong_augment_pipeline()
-
-    def _build_strong_augment_pipeline(self):
-        """Builds the Albumentations pipeline for strong augmentations."""
-        pipeline = A.Compose([
-            A.HorizontalFlip(p=0.5),
-            A.Affine(scale=(0.85, 1.15), translate_percent=(0.05, 0.05), rotate=(-10, 10), shear=(-5, 5), p=0.7, keep_ratio=True, fit_output=True),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-            A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
-        ], bbox_params=A.BboxParams(format='pascal_voc',
-                                   label_fields=['class_labels'],
-                                   min_visibility=0.1,
-                                   min_area=10))
-        return pipeline
-
-    def _apply_strong_augmentations(self, target_img_tensor, target_pseudo_labels):
-        """
-        Applies strong augmentations using Albumentations to target images and pseudo-labels.
-
-        Args:
-            target_img_tensor (torch.Tensor): Batch of target images (BCHW, float, 0-1).
-            target_pseudo_labels (torch.Tensor | None): Pseudo-labels ([N, 6] tensor [b_idx, cls, xywhn]).
-
-        Returns:
-            (tuple): Tuple containing:
-                - augmented_img_tensor (torch.Tensor): Augmented images (BCHW, float, 0-1).
-                - augmented_pseudo_labels (torch.Tensor | None): Augmented pseudo-labels ([M, 6] tensor [b_idx, cls, xywhn]).
-        """
-        if target_pseudo_labels is None or len(target_pseudo_labels) == 0 or self.strong_augment_pipeline is None:
-            return target_img_tensor, target_pseudo_labels
-
-        device = target_img_tensor.device
-        dtype = target_img_tensor.dtype
-        bs, _, h, w = target_img_tensor.shape
-
-        # 1. Convert images to list of NumPy arrays (HWC, uint8)
-        images_np = []
-        for i in range(bs):
-            img = target_img_tensor[i].permute(1, 2, 0).cpu().numpy()
-            img = (img * 255).round().astype(np.uint8)
-            images_np.append(img)
-
-        # 2. Convert pseudo-labels to Albumentations format (list of lists per image)
-        labels_by_image = [[] for _ in range(bs)]
-        class_labels_by_image = [[] for _ in range(bs)]
-
-        if target_pseudo_labels is not None and len(target_pseudo_labels) > 0:
-            original_indices = target_pseudo_labels[:, 0].long()
-            original_classes = target_pseudo_labels[:, 1]
-            original_boxes_xywhn = target_pseudo_labels[:, 2:]
-            original_boxes_xyxy = xywhn2xyxy(original_boxes_xywhn, w=w, h=h, padw=0, padh=0)
-
-            for i in range(len(target_pseudo_labels)):
-                img_idx = original_indices[i]
-                if img_idx >= bs: continue
-
-                cls_id = original_classes[i].item()
-                box_xyxy = original_boxes_xyxy[i].cpu().numpy().tolist()
-                x_min, y_min, x_max, y_max = box_xyxy
-                x_min, y_min = max(0, x_min), max(0, y_min)
-                x_max, y_max = min(w, x_max), min(h, y_max)
-
-                if x_max > x_min and y_max > y_min:
-                    labels_by_image[img_idx].append([x_min, y_min, x_max, y_max])
-                    class_labels_by_image[img_idx].append(cls_id)
-
-        # 3. Apply augmentations image by image
-        augmented_images_np = []
-        augmented_labels_list = []
-
-        for i in range(bs):
-            img_np = images_np[i]
-            bboxes = labels_by_image[i]
-            class_labels = class_labels_by_image[i]
-
-            try:
-                transformed = self.strong_augment_pipeline(image=img_np, bboxes=bboxes, class_labels=class_labels)
-                aug_img_np = transformed['image']
-                aug_bboxes_xyxy = transformed['bboxes']
-                aug_class_labels = transformed['class_labels']
-
-                # Ensure augmented image is resized back to target size if needed (e.g., after Affine(fit_output=True))
-                target_h, target_w = self.args.imgsz, self.args.imgsz
-                if aug_img_np.shape[0] != target_h or aug_img_np.shape[1] != target_w:
-                    aug_img_np = cv2.resize(aug_img_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-
-                augmented_images_np.append(aug_img_np)
-
-                # 4. Convert augmented labels back
-                if aug_bboxes_xyxy:
-                    aug_h, aug_w = aug_img_np.shape[:2]
-                    aug_bboxes_xyxy_tensor = torch.tensor(aug_bboxes_xyxy, device=device, dtype=dtype)
-                    aug_cls_tensor = torch.tensor(aug_class_labels, device=device, dtype=dtype).unsqueeze(1)
-
-                    # Clip boxes strictly within image boundaries before normalization
-                    aug_bboxes_xyxy_tensor[:, [0, 2]] = aug_bboxes_xyxy_tensor[:, [0, 2]].clamp(0, aug_w)
-                    aug_bboxes_xyxy_tensor[:, [1, 3]] = aug_bboxes_xyxy_tensor[:, [1, 3]].clamp(0, aug_h)
-
-                    aug_bboxes_xywhn = xyxy2xywhn(aug_bboxes_xyxy_tensor, w=aug_w, h=aug_h, clip=False, eps=1e-3)
-
-                    # Filter out invalid boxes (width or height <= 0 after clipping/conversion)
-                    valid_boxes_mask = (aug_bboxes_xywhn[:, 2] > 0) & (aug_bboxes_xywhn[:, 3] > 0)
-                    if valid_boxes_mask.any():
-                        aug_bboxes_xywhn = aug_bboxes_xywhn[valid_boxes_mask]
-                        aug_cls_tensor = aug_cls_tensor[valid_boxes_mask]
-                        batch_idx_tensor = torch.full((len(aug_bboxes_xywhn), 1), i, device=device, dtype=dtype)
-                        augmented_labels_list.append(torch.cat([batch_idx_tensor, aug_cls_tensor, aug_bboxes_xywhn], dim=1))
-
-            except Exception as e:
-                LOGGER.warning(f"Skipping strong augmentation for target image {i} due to error: {e}")
-                img_np_resized = cv2.resize(images_np[i], (self.args.imgsz, self.args.imgsz), interpolation=cv2.INTER_LINEAR)
-                augmented_images_np.append(img_np_resized)
-
-        # 5. Convert augmented images back to tensor
-        if not augmented_images_np:
-            return target_img_tensor, target_pseudo_labels
-
-        augmented_img_tensor = torch.stack([torch.from_numpy(img).permute(2, 0, 1) for img in augmented_images_np]).to(device).float() / 255.0
-
-        # 6. Concatenate all augmented labels
-        if augmented_labels_list:
-            augmented_pseudo_labels = torch.cat(augmented_labels_list, dim=0)
-        else:
-            augmented_pseudo_labels = torch.empty((0, 6), device=device, dtype=dtype)
-
-        return augmented_img_tensor, augmented_pseudo_labels
-
     def _do_train(self, world_size=1):
         """Train the model with the specified world size."""
         if world_size > 1:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
+
+        # Add default pseudo-label thresholds if not in args
+        self.args.pseudo_label_conf_thres = getattr(self.args, 'pseudo_label_conf', 0.4)  # Example threshold
+        self.args.nms_iou_thres = getattr(self.args, 'nms_iou', 0.45)  # Standard NMS IoU
 
         nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
@@ -579,56 +445,42 @@ class BaseTrainer:
                     target_batch = self.preprocess_batch(target_batch)
                     with torch.no_grad():
                         teacher = self.teacher_ema.ema.to(self.device).eval()
-                        teacher_preds_raw = teacher(target_batch['img'])
+                        teacher_preds_raw = teacher(target_batch['img'])  # Get raw predictions
 
+                        # Format predictions into pseudo-labels using the pseudo-label threshold for NMS
                         pseudo_labels = self._format_pseudo_labels(
                             preds_raw=teacher_preds_raw,
                             batch=target_batch,
-                            conf_thres=self.args.pseudo_label_conf_thres,
+                            conf_thres=self.args.pseudo_label_conf_thres,  # Use pseudo-label threshold directly for NMS
                             iou_thres=self.args.nms_iou_thres
                         )
 
                         target_batch_data = {
                             'img': target_batch['img'],
-                            'teacher_preds_raw': teacher_preds_raw,
-                            'pseudo_labels': pseudo_labels,
-                            'is_augmented': False
+                            'teacher_preds_raw': teacher_preds_raw,  # Keep raw preds if needed elsewhere
+                            'pseudo_labels': pseudo_labels  # Store formatted labels
                         }
+                # --- End Pseudo-Label Generation ---
 
-                    # --- Apply Strong Augmentation ---
-                    if self.args.strong_augment and self.strong_augment_pipeline:
-                        if target_batch_data['pseudo_labels'] is not None and len(target_batch_data['pseudo_labels']) > 0:
-                            try:
-                                aug_img, aug_labels = self._apply_strong_augmentations(
-                                    target_img_tensor=target_batch_data['img'].clone(),
-                                    target_pseudo_labels=target_batch_data['pseudo_labels'].clone()
-                                )
-                                target_batch_data['img'] = aug_img
-                                target_batch_data['pseudo_labels'] = aug_labels
-                                target_batch_data['is_augmented'] = True
-
-                            except Exception as e:
-                                LOGGER.warning(f"Strong augmentation failed for batch step {i}: {e}")
-                    # --- End Strong Augmentation ---
-
-                # --- End Pseudo-Label Generation & Augmentation ---
-
-                # Forward pass with student model
+                # 1) Supervised on *source* batch
+                batch = self.preprocess_batch(batch)
+                imgs_s, labels = batch['img'], batch['labels']
                 with autocast(self.amp):
-                    batch = self.preprocess_batch(batch)
-                    if target_batch_data:
-                        batch['target_batch_data'] = target_batch_data
+                    preds_s = self.model(imgs_s)
+                    Ls, sup_items = self.compute_loss(preds_s, labels)
 
-                    loss, self.loss_items = self.model(batch)
-                    self.loss = loss.sum()
-                    if RANK != -1:
-                        self.loss *= world_size
-                    self.tloss = (
-                        (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
-                    )
+                # 2) Unsupervised on *target* (strong) batch
+                tb = target_batch_data
+                # assume tb['img'] is already your *strong* view
+                with autocast(self.amp):
+                    preds_u = self.model(tb['img'])
+                    Lu, unsup_items = self.compute_loss(preds_u, tb['pseudo_labels'])
 
-                # Backward
-                self.scaler.scale(self.loss).backward()
+                # 3) Combine & backward
+                total = Ls + self.args.unsup_weight * Lu
+                self.scaler.scale(total).backward()
+                self.loss = total  # for logging
+                self.loss_items = torch.cat([sup_items, unsup_items], dim=0)
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
@@ -652,10 +504,10 @@ class BaseTrainer:
                         ("%11s" * 2 + "%11.4g" * (2 + loss_length))
                         % (
                             f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
-                            batch["cls"].shape[0],
-                            batch["img"].shape[-1],
+                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                            batch["cls"].shape[0],  # batch size, i.e. 8
+                            batch["img"].shape[-1],  # imgsz, i.e 640
                         )
                     )
                     self.run_callbacks("on_batch_end")
@@ -664,26 +516,28 @@ class BaseTrainer:
 
                 self.run_callbacks("on_train_batch_end")
 
-            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}
+            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 final_epoch = epoch + 1 >= self.epochs
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
-                teacher_metrics = {}
+                teacher_metrics = {}  # Initialize dict for teacher metrics
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
 
                     # --- Teacher Validation ---
                     if hasattr(self, 'teacher_ema') and self.teacher_ema:
                         LOGGER.info("Validating Teacher model...")
+                        # Validate teacher on source test set
                         teacher_src_metrics = self.validator(model=self.teacher_ema.ema)
                         teacher_metrics["teacher/src_precision"] = teacher_src_metrics.get('metrics/precision(B)', 0)
                         teacher_metrics["teacher/src_recall"] = teacher_src_metrics.get('metrics/recall(B)', 0)
                         teacher_metrics["teacher/src_map50-95"] = teacher_src_metrics.get('metrics/mAP50-95(B)', 0)
                         teacher_metrics["teacher/src_map50"] = teacher_src_metrics.get('metrics/mAP50(B)', 0)
 
+                        # Validate teacher on target test set (if available)
                         if hasattr(self, 'target_test_loader') and self.target_test_loader:
                             LOGGER.info("Validating Teacher model on Target dataset...")
                             original_dataloader = self.validator.dataloader
@@ -693,10 +547,11 @@ class BaseTrainer:
                             teacher_metrics["teacher/tgt_recall"] = teacher_tgt_metrics.get('metrics/recall(B)', 0)
                             teacher_metrics["teacher/tgt_map50-95"] = teacher_tgt_metrics.get('metrics/mAP50-95(B)', 0)
                             teacher_metrics["teacher/tgt_map50"] = teacher_tgt_metrics.get('metrics/mAP50(B)', 0)
-                            self.validator.dataloader = original_dataloader
+                            self.validator.dataloader = original_dataloader  # Restore original dataloader
                         LOGGER.info("Teacher validation finished.")
                     # --- End Teacher Validation ---
 
+                # Combine student and teacher metrics for saving
                 all_metrics_to_save = {**self.label_loss_items(self.tloss), **self.metrics, **self.lr, **teacher_metrics}
                 self.save_metrics(metrics=all_metrics_to_save)
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
@@ -708,6 +563,7 @@ class BaseTrainer:
                     self.save_model()
                     self.run_callbacks("on_model_save")
 
+            # Scheduler
             t = time.time()
             self.epoch_time = t - self.epoch_time_start
             self.epoch_time_start = t
@@ -715,21 +571,23 @@ class BaseTrainer:
                 mean_epoch_time = (t - self.train_time_start) / (epoch - self.start_epoch + 1)
                 self.epochs = self.args.epochs = math.ceil(self.args.time * 3600 / mean_epoch_time)
                 self._setup_scheduler()
-                self.scheduler.last_epoch = self.epoch
-                self.stop |= epoch >= self.epochs
+                self.scheduler.last_epoch = self.epoch  # do not move
+                self.stop |= epoch >= self.epochs  # stop if exceeded epochs
             self.run_callbacks("on_fit_epoch_end")
             if self._get_memory(fraction=True) > 0.5:
-                self._clear_memory()
+                self._clear_memory()  # clear if memory utilization > 50%
 
-            if RANK != -1:
+            # Early Stopping
+            if RANK != -1:  # if DDP training
                 broadcast_list = [self.stop if RANK == 0 else None]
-                dist.broadcast_object_list(broadcast_list, 0)
+                dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
                 self.stop = broadcast_list[0]
             if self.stop:
-                break
+                break  # must break all DDP ranks
             epoch += 1
 
         if RANK in {-1, 0}:
+            # Do final val with best.pt
             seconds = time.time() - self.train_time_start
             LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
             self.final_eval()
@@ -760,21 +618,24 @@ class BaseTrainer:
         if img_idx is None:
             LOGGER.warning("Batch index ('batch_idx') not found in target batch for pseudo-label formatting.")
             return None
-        img_h, img_w = batch['img'].shape[2:]
+        img_h, img_w = batch['img'].shape[2:]  # Assuming H, W
 
+        # Apply NMS using the provided confidence threshold (originally pseudo_label_conf_thres)
         preds_nms = non_max_suppression(preds_raw,
                                         conf_thres=conf_thres,
                                         iou_thres=iou_thres,
                                         multi_label=False,
                                         max_det=300)
 
+        # Iterate through NMS results per image
         for si, pred in enumerate(preds_nms):
             if pred is None or len(pred) == 0:
                 continue
 
+            # Create labels tensor [batch_idx, cls, xywhn]
             batch_idx_tensor = torch.full((pred.shape[0], 1), img_idx[si], device=self.device, dtype=pred.dtype)
-            cls_tensor = pred[:, 5:6]
-            xywhn_tensor = xyxy2xywhn(pred[:, :4], w=img_w, h=img_h, clip=True)
+            cls_tensor = pred[:, 5:6]  # Class index is the 6th element
+            xywhn_tensor = xyxy2xywhn(pred[:, :4], w=img_w, h=img_h, clip=True)  # Bbox is the first 4 elements
 
             formatted_labels.append(torch.cat((batch_idx_tensor, cls_tensor, xywhn_tensor), dim=1))
 
@@ -791,7 +652,7 @@ class BaseTrainer:
             amp=self.amp,
             batch=self.batch_size,
             max_num_obj=max_num_obj,
-        )
+        )  # returns batch size
 
     def _get_memory(self, fraction=False):
         """Get accelerator memory utilization in GB or as a fraction of total memory."""
@@ -818,13 +679,14 @@ class BaseTrainer:
 
     def read_results_csv(self):
         """Read results.csv into a dictionary using pandas."""
-        import pandas as pd
+        import pandas as pd  # scope for faster 'import ultralytics'
 
         return pd.read_csv(self.csv).to_dict(orient="list")
 
     def _model_train(self):
         """Set model in training mode."""
         self.model.train()
+        # Freeze BN stat
         for n, m in self.model.named_modules():
             if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
                 m.eval()
@@ -833,15 +695,16 @@ class BaseTrainer:
         """Save model training checkpoints with additional metadata."""
         import io
 
+        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
         buffer = io.BytesIO()
         ckpt = {
             "epoch": self.epoch,
             "best_fitness": self.best_fitness,
-            "model": None,
+            "model": None,  # resume and final checkpoints derive from EMA
             "ema": deepcopy(self.ema.ema).half(),
             "updates": self.ema.updates,
             "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-            "train_args": vars(self.args),
+            "train_args": vars(self.args),  # save as dict
             "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
             "train_results": self.read_results_csv() if self.csv.exists() else None,
             "date": datetime.now().isoformat(),
@@ -854,13 +717,14 @@ class BaseTrainer:
             ckpt["teacher_updates"] = self.teacher_ema.updates
 
         torch.save(ckpt, buffer)
-        serialized_ckpt = buffer.getvalue()
+        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
 
-        self.last.write_bytes(serialized_ckpt)
+        # Save checkpoints
+        self.last.write_bytes(serialized_ckpt)  # save last.pt
         if self.best_fitness == self.fitness:
-            self.best.write_bytes(serialized_ckpt)
+            self.best.write_bytes(serialized_ckpt)  # save best.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
+            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
 
     def get_dataset(self):
         """
@@ -880,13 +744,13 @@ class BaseTrainer:
             }:
                 data = check_det_dataset(self.args.data)
                 if "yaml_file" in data:
-                    self.args.data = data["yaml_file"]
+                    self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
             else:
                 raise ValueError(f"Unsupported dataset format for primary data: {self.args.data}")
         except Exception as e:
             raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e
 
-        self.data = data
+        self.data = data  # Store primary dataset info
         if self.args.single_cls:
             LOGGER.info("Overriding class names with single class for primary dataset.")
             data["names"] = {0: "item"}
@@ -906,6 +770,7 @@ class BaseTrainer:
 
         LOGGER.info(f"Loading target dataset from '{clean_url(self.args.target_data)}'...")
         try:
+            # Use the same task type as the primary dataset for checking
             if self.args.task == "classify":
                 target_data = check_cls_dataset(self.args.target_data)
             elif self.args.target_data.split(".")[-1] in {"yaml", "yml"} or self.args.task in {
@@ -930,7 +795,7 @@ class BaseTrainer:
         Returns:
             (dict): Optional checkpoint to resume training from.
         """
-        if isinstance(self.model, torch.nn.Module):
+        if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
             return
 
         cfg, weights = self.model, None
@@ -941,24 +806,26 @@ class BaseTrainer:
         elif isinstance(self.args.pretrained, (str, Path)):
             weights, _ = attempt_load_one_weight(self.args.pretrained)
         if not self.data:
-            self.data, _, _ = self.get_dataset()
+            self.data, _, _ = self.get_dataset()  # Load primary dataset info if not already loaded
 
-        self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)
+        self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         return ckpt
 
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update."""
-        self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        self.scaler.unscale_(self.optimizer)  # unscale gradients
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)  # clip gradients
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
         if self.ema:
             self.ema.update(self.model.module if hasattr(self.model, 'module') else self.model)
 
-        if self.teacher_ema and RANK in {-1, 0}:
+        # --- Teacher EMA Update ---
+        if self.teacher_ema and RANK in {-1, 0}:  # Update teacher only on main process
             student_model_state = self.model.module if hasattr(self.model, 'module') else self.model
             self.teacher_ema.update(student_model_state)
+        # --- End Teacher EMA Update ---
 
     def preprocess_batch(self, batch):
         """Allows custom preprocessing model inputs and ground truths depending on task type."""
@@ -972,7 +839,7 @@ class BaseTrainer:
             (tuple): A tuple containing metrics dictionary and fitness score.
         """
         metrics = self.validator(self)
-        fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())
+        fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
         return metrics, fitness
@@ -1029,8 +896,8 @@ class BaseTrainer:
     def save_metrics(self, metrics):
         """Save training metrics to a CSV file."""
         keys, vals = list(metrics.keys()), list(metrics.values())
-        n = len(metrics) + 2
-        s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")
+        n = len(metrics) + 2  # number of cols
+        s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # header
         t = time.time() - self.train_time_start
         with open(self.csv, "a", encoding="utf-8") as f:
             f.write(s + ("%.6g," * n % tuple([self.epoch + 1, t] + vals)).rstrip(",") + "\n")
@@ -1052,7 +919,7 @@ class BaseTrainer:
                 if f is self.last:
                     ckpt = strip_optimizer(f)
                 elif f is self.best:
-                    k = "train_results"
+                    k = "train_results"  # update best.pt train_metrics from last.pt
                     strip_optimizer(f, updates={k: ckpt[k]} if k in ckpt else None)
                     LOGGER.info(f"\nValidating {f}...")
                     self.validator.args.plots = self.args.plots
@@ -1074,13 +941,13 @@ class BaseTrainer:
 
                 resume = True
                 self.args = get_cfg(ckpt_args)
-                self.args.model = self.args.resume = str(last)
+                self.args.model = self.args.resume = str(last)  # reinstate model
                 for k in (
                     "imgsz",
                     "batch",
                     "device",
                     "close_mosaic",
-                ):
+                ):  # allow arg updates to reduce memory or update device on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
 
@@ -1098,12 +965,13 @@ class BaseTrainer:
         best_fitness = 0.0
         start_epoch = ckpt.get("epoch", -1) + 1
         if ckpt.get("optimizer", None) is not None:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])  # optimizer
             best_fitness = ckpt["best_fitness"]
         if self.ema and ckpt.get("ema"):
-            self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())
+            self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())  # EMA
             self.ema.updates = ckpt["updates"]
 
+        # --- Teacher EMA Resume ---
         if hasattr(self, 'teacher_ema') and self.teacher_ema and ckpt.get("teacher_ema"):
             LOGGER.info("Resuming teacher EMA state...")
             self.teacher_ema.ema.load_state_dict(ckpt["teacher_ema"].float().state_dict())
@@ -1112,6 +980,7 @@ class BaseTrainer:
             LOGGER.warning("Resuming from checkpoint without teacher EMA state. Re-initializing teacher EMA from current student EMA.")
             self.teacher_ema.ema.load_state_dict(self.ema.ema.float().state_dict())
             self.teacher_ema.updates = self.ema.updates
+        # --- End Teacher EMA Resume ---
 
         assert start_epoch > 0, (
             f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
@@ -1122,7 +991,7 @@ class BaseTrainer:
             LOGGER.info(
                 f"{self.model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs."
             )
-            self.epochs += ckpt["epoch"]
+            self.epochs += ckpt["epoch"]  # finetune additional epochs
         self.best_fitness = best_fitness
         self.start_epoch = start_epoch
         if start_epoch > (self.epochs - self.args.close_mosaic):
@@ -1153,27 +1022,27 @@ class BaseTrainer:
         Returns:
             (torch.optim.Optimizer): The constructed optimizer.
         """
-        g = [], [], []
-        bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
+        g = [], [], []  # optimizer parameter groups
+        bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
         if name == "auto":
             LOGGER.info(
                 f"{colorstr('optimizer:')} 'optimizer=auto' found, "
                 f"ignoring 'lr0={self.args.lr0}' and 'momentum={self.args.momentum}' and "
                 f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
             )
-            nc = self.data.get("nc", 10)
-            lr_fit = round(0.002 * 5 / (4 + nc), 6)
+            nc = self.data.get("nc", 10)  # number of classes
+            lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
             name, lr, momentum = ("SGD", 0.01, 0.9) if iterations > 10000 else ("AdamW", lr_fit, 0.9)
-            self.args.warmup_bias_lr = 0.0
+            self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam
 
         for module_name, module in model.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
                 fullname = f"{module_name}.{param_name}" if module_name else param_name
-                if "bias" in fullname:
+                if "bias" in fullname:  # bias (no decay)
                     g[2].append(param)
-                elif isinstance(module, bn) or "logit_scale" in fullname:
+                elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
                     g[1].append(param)
-                else:
+                else:  # weight (with decay)
                     g[0].append(param)
 
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
@@ -1190,8 +1059,8 @@ class BaseTrainer:
                 "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
             )
 
-        optimizer.add_param_group({"params": g[0], "weight_decay": decay})
-        optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})
+        optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
+        optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
             f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
