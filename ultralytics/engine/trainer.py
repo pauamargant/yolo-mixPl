@@ -41,12 +41,14 @@ from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
+from ultralytics.utils.ops import xyxy2xywhn
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
     ModelEMA,
     autocast,
     convert_optimizer_state_dict_to_fp16,
+    de_parallel,
     init_seeds,
     one_cycle,
     select_device,
@@ -147,7 +149,9 @@ class BaseTrainer:
         self.testset = None
         self.target_data_info = None  # Target dataset info dict
         self.target_trainset = None
+        self.target_train_loader_iter = None  # Add iterator for target train loader
         self.target_testset = None
+        self.target_test_loader = None
 
         # Optimization utils init
         self.lf = None
@@ -387,6 +391,8 @@ class BaseTrainer:
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
+        if hasattr(self, 'target_train_loader') and self.target_train_loader:
+            self.target_train_loader_iter = iter(self.target_train_loader)
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -422,9 +428,32 @@ class BaseTrainer:
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
-                # Forward
+                # --- Get Target Batch and Generate Pseudo-Labels ---
+                target_batch_data = None
+                if RANK in {-1, 0} and hasattr(self, 'target_train_loader_iter') and self.target_train_loader_iter and \
+                   hasattr(self, 'teacher_ema') and self.teacher_ema:
+                    try:
+                        target_batch = next(self.target_train_loader_iter)
+                    except StopIteration:
+                        self.target_train_loader_iter = iter(self.target_train_loader)
+                        target_batch = next(self.target_train_loader_iter)
+
+                    target_batch = self.preprocess_batch(target_batch)
+                    with torch.no_grad():
+                        teacher = self.teacher_ema.ema.to(self.device).eval()
+                        teacher_preds = teacher(target_batch['img'])
+                        target_batch_data = {
+                            'img': target_batch['img'],
+                            'teacher_preds': teacher_preds
+                        }
+                # --- End Pseudo-Label Generation ---
+
+                # Forward pass with student model on source batch
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
+                    if target_batch_data:
+                        batch['target_batch_data'] = target_batch_data
+
                     loss, self.loss_items = self.model(batch)
                     self.loss = loss.sum()
                     if RANK != -1:

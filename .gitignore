@@ -174,3 +174,7 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+
+
+# test
+test_detect_target/

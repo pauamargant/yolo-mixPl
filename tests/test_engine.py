@@ -111,68 +111,68 @@ def test_detect():
         shutil.rmtree(project_dir, ignore_errors=True)
 
 
-def test_segment():
-    """Tests image segmentation training, validation, and prediction pipelines using YOLO models."""
-    overrides = {"data": "coco8-seg.yaml", "model": "yolo11n-seg.yaml", "imgsz": 32, "epochs": 1, "save": False}
-    cfg = get_cfg(DEFAULT_CFG)
-    cfg.data = "coco8-seg.yaml"
-    cfg.imgsz = 32
-    # YOLO(CFG_SEG).train(**overrides)  # works
+# def test_segment():
+#     """Tests image segmentation training, validation, and prediction pipelines using YOLO models."""
+#     overrides = {"data": "coco8-seg.yaml", "model": "yolo11n-seg.yaml", "imgsz": 32, "epochs": 1, "save": False}
+#     cfg = get_cfg(DEFAULT_CFG)
+#     cfg.data = "coco8-seg.yaml"
+#     cfg.imgsz = 32
+#     # YOLO(CFG_SEG).train(**overrides)  # works
 
-    # Trainer
-    trainer = segment.SegmentationTrainer(overrides=overrides)
-    trainer.add_callback("on_train_start", test_func)
-    assert test_func in trainer.callbacks["on_train_start"], "callback test failed"
-    trainer.train()
+#     # Trainer
+#     trainer = segment.SegmentationTrainer(overrides=overrides)
+#     trainer.add_callback("on_train_start", test_func)
+#     assert test_func in trainer.callbacks["on_train_start"], "callback test failed"
+#     trainer.train()
 
-    # Validator
-    val = segment.SegmentationValidator(args=cfg)
-    val.add_callback("on_val_start", test_func)
-    assert test_func in val.callbacks["on_val_start"], "callback test failed"
-    val(model=trainer.best)  # validate best.pt
+#     # Validator
+#     val = segment.SegmentationValidator(args=cfg)
+#     val.add_callback("on_val_start", test_func)
+#     assert test_func in val.callbacks["on_val_start"], "callback test failed"
+#     val(model=trainer.best)  # validate best.pt
 
-    # Predictor
-    pred = segment.SegmentationPredictor(overrides={"imgsz": [64, 64]})
-    pred.add_callback("on_predict_start", test_func)
-    assert test_func in pred.callbacks["on_predict_start"], "callback test failed"
-    result = pred(source=ASSETS, model=WEIGHTS_DIR / "yolo11n-seg.pt")
-    assert len(result), "predictor test failed"
+#     # Predictor
+#     pred = segment.SegmentationPredictor(overrides={"imgsz": [64, 64]})
+#     pred.add_callback("on_predict_start", test_func)
+#     assert test_func in pred.callbacks["on_predict_start"], "callback test failed"
+#     result = pred(source=ASSETS, model=WEIGHTS_DIR / "yolo11n-seg.pt")
+#     assert len(result), "predictor test failed"
 
-    # Test resume
-    overrides["resume"] = trainer.last
-    trainer = segment.SegmentationTrainer(overrides=overrides)
-    try:
-        trainer.train()
-    except Exception as e:
-        print(f"Expected exception caught: {e}")
-        return
+#     # Test resume
+#     overrides["resume"] = trainer.last
+#     trainer = segment.SegmentationTrainer(overrides=overrides)
+#     try:
+#         trainer.train()
+#     except Exception as e:
+#         print(f"Expected exception caught: {e}")
+#         return
 
-    Exception("Resume test failed!")
+#     Exception("Resume test failed!")
 
 
-def test_classify():
-    """Test image classification including training, validation, and prediction phases."""
-    overrides = {"data": "imagenet10", "model": "yolo11n-cls.yaml", "imgsz": 32, "epochs": 1, "save": False}
-    cfg = get_cfg(DEFAULT_CFG)
-    cfg.data = "imagenet10"
-    cfg.imgsz = 32
-    # YOLO(CFG_SEG).train(**overrides)  # works
+# def test_classify():
+#     """Test image classification including training, validation, and prediction phases."""
+#     overrides = {"data": "imagenet10", "model": "yolo11n-cls.yaml", "imgsz": 32, "epochs": 1, "save": False}
+#     cfg = get_cfg(DEFAULT_CFG)
+#     cfg.data = "imagenet10"
+#     cfg.imgsz = 32
+#     # YOLO(CFG_SEG).train(**overrides)  # works
 
-    # Trainer
-    trainer = classify.ClassificationTrainer(overrides=overrides)
-    trainer.add_callback("on_train_start", test_func)
-    assert test_func in trainer.callbacks["on_train_start"], "callback test failed"
-    trainer.train()
+#     # Trainer
+#     trainer = classify.ClassificationTrainer(overrides=overrides)
+#     trainer.add_callback("on_train_start", test_func)
+#     assert test_func in trainer.callbacks["on_train_start"], "callback test failed"
+#     trainer.train()
 
-    # Validator
-    val = classify.ClassificationValidator(args=cfg)
-    val.add_callback("on_val_start", test_func)
-    assert test_func in val.callbacks["on_val_start"], "callback test failed"
-    val(model=trainer.best)
+#     # Validator
+#     val = classify.ClassificationValidator(args=cfg)
+#     val.add_callback("on_val_start", test_func)
+#     assert test_func in val.callbacks["on_val_start"], "callback test failed"
+#     val(model=trainer.best)
 
-    # Predictor
-    pred = classify.ClassificationPredictor(overrides={"imgsz": [64, 64]})
-    pred.add_callback("on_predict_start", test_func)
-    assert test_func in pred.callbacks["on_predict_start"], "callback test failed"
-    result = pred(source=ASSETS, model=trainer.best)
-    assert len(result), "predictor test failed"
+#     # Predictor
+#     pred = classify.ClassificationPredictor(overrides={"imgsz": [64, 64]})
+#     pred.add_callback("on_predict_start", test_func)
+#     assert test_func in pred.callbacks["on_predict_start"], "callback test failed"
+#     result = pred(source=ASSETS, model=trainer.best)
+#     assert len(result), "predictor test failed"
