@@ -440,7 +440,8 @@ class BaseTrainer:
                     self.metrics, self.fitness = self.validate()
 
                 #TODO: change when implemented target domain
-                if self.teacher_model:
+                if self.args.target_dataset:
+                    print("Target Domain Validation")
                     LOGGER.info(f"Target domain validation...")
                     # orig_loader = self.test_loader
                     # self.test_loader = 
