@@ -64,6 +64,8 @@ class BaseTrainer:
         args (SimpleNamespace): Configuration for the trainer.
         validator (BaseValidator): Validator instance.
         model (nn.Module): Model instance.
+        teacher_model (nn.Module): Teacher model instance.
+        teacher_ema (ModelEMA): Teacher EMA instance.
         callbacks (defaultdict): Dictionary of callbacks.
         save_dir (Path): Directory to save results.
         wdir (Path): Directory to save weights.
@@ -131,11 +133,21 @@ class BaseTrainer:
         if self.device.type in {"cpu", "mps"}:
             self.args.workers = 0  # faster CPU training as time dominated by inference, not dataloading
 
-        # Model and Dataset
+        # Model
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
-        with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
-            self.trainset, self.testset = self.get_dataset()
-        self.ema = None
+
+        # Teacher-Student Framework attributes
+        self.teacher_model = None
+        self.teacher_ema = None
+        self.args.teacher_ema_decay = getattr(self.args, 'teacher_ema_decay', 0.9998)
+
+        # Datasets
+        self.data = None  # Main dataset info dict
+        self.trainset = None
+        self.testset = None
+        self.target_data_info = None  # Target dataset info dict
+        self.target_trainset = None
+        self.target_testset = None
 
         # Optimization utils init
         self.lf = None
@@ -286,7 +298,13 @@ class BaseTrainer:
             self.args.batch = self.batch_size = self.auto_batch()
 
         # Dataloaders
+        with torch_distributed_zero_first(LOCAL_RANK):  # Load datasets on rank 0 first
+            self.data, self.trainset, self.testset = self.get_dataset()  # Load main dataset
+            if self.args.target_data:
+                self.target_data_info, self.target_trainset, self.target_testset = self._get_target_dataset()  # Load target dataset
+
         batch_size = self.batch_size // max(world_size, 1)
+        # Main Dataloaders
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, rank=LOCAL_RANK, mode="train")
         if RANK in {-1, 0}:
             # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
@@ -297,8 +315,34 @@ class BaseTrainer:
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             self.ema = ModelEMA(self.model)
+
+            # --- Teacher Model Setup ---
+            LOGGER.info(f"Setting up Teacher model with EMA decay {self.args.teacher_ema_decay}...")
+            self.teacher_model = deepcopy(self.model).eval()
+            for param in self.teacher_model.parameters():
+                param.requires_grad = False
+            self.teacher_ema = ModelEMA(self.teacher_model, decay=self.args.teacher_ema_decay)
+            
+            self.teacher_ema.ema = deepcopy(self.model).eval()
+            self.teacher_ema.updates = 0
+            # --- End Teacher Model Setup ---
+
             if self.args.plots:
                 self.plot_training_labels()
+
+        # Target Dataloaders (if target data exists)
+        self.target_train_loader = None
+        self.target_test_loader = None
+        if self.args.target_data and self.target_trainset:
+            self.target_train_loader = self.get_dataloader(
+                self.target_trainset, batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+            )
+            LOGGER.info(f"Target dataset '{self.args.target_data}' train loader created.")
+        if self.args.target_data and self.target_testset and RANK in {-1, 0}:
+            self.target_test_loader = self.get_dataloader(
+                self.target_testset, batch_size=batch_size * 2, rank=-1, mode="val"
+            )
+            LOGGER.info(f"Target dataset '{self.args.target_data}' val loader created.")
 
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
@@ -433,9 +477,37 @@ class BaseTrainer:
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
+                teacher_metrics = {}  # Initialize dict for teacher metrics
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
-                self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+
+                    # --- Teacher Validation ---
+                    if hasattr(self, 'teacher_ema') and self.teacher_ema:
+                        LOGGER.info("Validating Teacher model...")
+                        # Validate teacher on source test set
+                        teacher_src_metrics = self.validator(model=self.teacher_ema.ema)
+                        teacher_metrics["teacher/src_precision"] = teacher_src_metrics.get('metrics/precision(B)', 0)
+                        teacher_metrics["teacher/src_recall"] = teacher_src_metrics.get('metrics/recall(B)', 0)
+                        teacher_metrics["teacher/src_map50-95"] = teacher_src_metrics.get('metrics/mAP50-95(B)', 0)
+                        teacher_metrics["teacher/src_map50"] = teacher_src_metrics.get('metrics/mAP50(B)', 0)
+
+                        # Validate teacher on target test set (if available)
+                        if hasattr(self, 'target_test_loader') and self.target_test_loader:
+                            LOGGER.info("Validating Teacher model on Target dataset...")
+                            original_dataloader = self.validator.dataloader
+                            self.validator.dataloader = self.target_test_loader
+                            teacher_tgt_metrics = self.validator(model=self.teacher_ema.ema)
+                            teacher_metrics["teacher/tgt_precision"] = teacher_tgt_metrics.get('metrics/precision(B)', 0)
+                            teacher_metrics["teacher/tgt_recall"] = teacher_tgt_metrics.get('metrics/recall(B)', 0)
+                            teacher_metrics["teacher/tgt_map50-95"] = teacher_tgt_metrics.get('metrics/mAP50-95(B)', 0)
+                            teacher_metrics["teacher/tgt_map50"] = teacher_tgt_metrics.get('metrics/mAP50(B)', 0)
+                            self.validator.dataloader = original_dataloader  # Restore original dataloader
+                        LOGGER.info("Teacher validation finished.")
+                    # --- End Teacher Validation ---
+
+                # Combine student and teacher metrics for saving
+                all_metrics_to_save = {**self.label_loss_items(self.tloss), **self.metrics, **self.lr, **teacher_metrics}
+                self.save_metrics(metrics=all_metrics_to_save)
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -533,24 +605,26 @@ class BaseTrainer:
 
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
         buffer = io.BytesIO()
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(self.ema.ema).half(),
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
-                "train_results": self.read_results_csv(),
-                "date": datetime.now().isoformat(),
-                "version": __version__,
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-            },
-            buffer,
-        )
+        ckpt = {
+            "epoch": self.epoch,
+            "best_fitness": self.best_fitness,
+            "model": None,  # resume and final checkpoints derive from EMA
+            "ema": deepcopy(self.ema.ema).half(),
+            "updates": self.ema.updates,
+            "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+            "train_args": vars(self.args),  # save as dict
+            "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
+            "train_results": self.read_results_csv() if self.csv.exists() else None,
+            "date": datetime.now().isoformat(),
+            "version": __version__,
+            "license": "AGPL-3.0 (https://ultralytics.com/license)",
+            "docs": "https://docs.ultralytics.com",
+        }
+        if self.teacher_ema:
+            ckpt["teacher_ema"] = deepcopy(self.teacher_ema.ema).half()
+            ckpt["teacher_updates"] = self.teacher_ema.updates
+
+        torch.save(ckpt, buffer)
         serialized_ckpt = buffer.getvalue()  # get the serialized content to save
 
         # Save checkpoints
@@ -559,15 +633,13 @@ class BaseTrainer:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
-        # if self.args.close_mosaic and self.epoch == (self.epochs - self.args.close_mosaic - 1):
-        #    (self.wdir / "last_mosaic.pt").write_bytes(serialized_ckpt)  # save mosaic checkpoint
 
     def get_dataset(self):
         """
-        Get train and validation datasets from data dictionary.
+        Get train and validation datasets from the primary data source specified in args.data.
 
         Returns:
-            (tuple): A tuple containing the training and validation/test datasets.
+            (tuple): A tuple containing the dataset info dict, training dataset, and validation/test dataset.
         """
         try:
             if self.args.task == "classify":
@@ -581,14 +653,48 @@ class BaseTrainer:
                 data = check_det_dataset(self.args.data)
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
+            else:
+                raise ValueError(f"Unsupported dataset format for primary data: {self.args.data}")
         except Exception as e:
             raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e
-        self.data = data
+
+        self.data = data  # Store primary dataset info
         if self.args.single_cls:
-            LOGGER.info("Overriding class names with single class.")
-            self.data["names"] = {0: "item"}
-            self.data["nc"] = 1
-        return data["train"], data.get("val") or data.get("test")
+            LOGGER.info("Overriding class names with single class for primary dataset.")
+            data["names"] = {0: "item"}
+            data["nc"] = 1
+        return data, data["train"], data.get("val") or data.get("test")
+
+    def _get_target_dataset(self):
+        """
+        Get train and validation datasets from the target data source specified in args.target_data.
+
+        Returns:
+            (tuple): A tuple containing the target dataset info dict, target training dataset,
+                     and target validation/test dataset. Returns (None, None, None) if args.target_data is not set.
+        """
+        if not self.args.target_data:
+            return None, None, None
+
+        LOGGER.info(f"Loading target dataset from '{clean_url(self.args.target_data)}'...")
+        try:
+            # Use the same task type as the primary dataset for checking
+            if self.args.task == "classify":
+                target_data = check_cls_dataset(self.args.target_data)
+            elif self.args.target_data.split(".")[-1] in {"yaml", "yml"} or self.args.task in {
+                "detect",
+                "segment",
+                "pose",
+                "obb",
+            }:
+                target_data = check_det_dataset(self.args.target_data)
+            else:
+                raise ValueError(f"Unsupported dataset format for target data: {self.args.target_data}")
+
+        except Exception as e:
+            raise RuntimeError(emojis(f"Target dataset '{clean_url(self.args.target_data)}' error ❌ {e}")) from e
+
+        return target_data, target_data.get("train"), target_data.get("val") or target_data.get("test")
 
     def setup_model(self):
         """
@@ -607,6 +713,9 @@ class BaseTrainer:
             cfg = weights.yaml
         elif isinstance(self.args.pretrained, (str, Path)):
             weights, _ = attempt_load_one_weight(self.args.pretrained)
+        if not self.data:
+            self.data, _, _ = self.get_dataset()  # Load primary dataset info if not already loaded
+
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         return ckpt
 
@@ -618,7 +727,13 @@ class BaseTrainer:
         self.scaler.update()
         self.optimizer.zero_grad()
         if self.ema:
-            self.ema.update(self.model)
+            self.ema.update(self.model.module if hasattr(self.model, 'module') else self.model)
+
+        # --- Teacher EMA Update ---
+        if self.teacher_ema and RANK in {-1, 0}:  # Update teacher only on main process
+            student_model_state = self.model.module if hasattr(self.model, 'module') else self.model
+            self.teacher_ema.update(student_model_state)
+        # --- End Teacher EMA Update ---
 
     def preprocess_batch(self, batch):
         """Allows custom preprocessing model inputs and ground truths depending on task type."""
@@ -639,7 +754,9 @@ class BaseTrainer:
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get model and raise NotImplementedError for loading cfg files."""
-        raise NotImplementedError("This task trainer doesn't support loading cfg files")
+        if not hasattr(self, "data") or not self.data:
+            raise RuntimeError("Primary dataset information (self.data) must be loaded before setting up the model.")
+        raise NotImplementedError("get_model function not implemented in BaseTrainer. Implement in subclass.")
 
     def get_validator(self):
         """Returns a NotImplementedError when the get_validator function is called."""
@@ -664,6 +781,8 @@ class BaseTrainer:
 
     def set_model_attributes(self):
         """Set or update model parameters before training."""
+        if not self.data:
+            raise RuntimeError("Primary dataset information (self.data) must be loaded before setting model attributes.")
         self.model.names = self.data["names"]
 
     def build_targets(self, preds, targets):
@@ -674,7 +793,6 @@ class BaseTrainer:
         """Returns a string describing training progress."""
         return ""
 
-    # TODO: may need to put these following functions into callback
     def plot_training_samples(self, batch, ni):
         """Plots training samples during YOLO training."""
         pass
@@ -725,7 +843,6 @@ class BaseTrainer:
                 exists = isinstance(resume, (str, Path)) and Path(resume).exists()
                 last = Path(check_file(resume) if exists else get_latest_run())
 
-                # Check that resume data YAML exists, otherwise strip to force re-download of dataset
                 ckpt_args = attempt_load_weights(last).args
                 if not isinstance(ckpt_args["data"], dict) and not Path(ckpt_args["data"]).exists():
                     ckpt_args["data"] = self.args.data
@@ -761,11 +878,23 @@ class BaseTrainer:
         if self.ema and ckpt.get("ema"):
             self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())  # EMA
             self.ema.updates = ckpt["updates"]
+
+        # --- Teacher EMA Resume ---
+        if hasattr(self, 'teacher_ema') and self.teacher_ema and ckpt.get("teacher_ema"):
+            LOGGER.info("Resuming teacher EMA state...")
+            self.teacher_ema.ema.load_state_dict(ckpt["teacher_ema"].float().state_dict())
+            self.teacher_ema.updates = ckpt.get("teacher_updates", self.teacher_ema.updates)
+        elif hasattr(self, 'teacher_ema') and self.teacher_ema:
+            LOGGER.warning("Resuming from checkpoint without teacher EMA state. Re-initializing teacher EMA from current student EMA.")
+            self.teacher_ema.ema.load_state_dict(self.ema.ema.float().state_dict())
+            self.teacher_ema.updates = self.ema.updates
+        # --- End Teacher EMA Resume ---
+
         assert start_epoch > 0, (
             f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
             f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
         )
-        LOGGER.info(f"Resuming training {self.args.model} from epoch {start_epoch + 1} to {self.epochs} total epochs")
+        LOGGER.info(f"Resuming training {self.args.model} from epoch {start_epoch} to {self.epochs} total epochs")
         if self.epochs < start_epoch:
             LOGGER.info(
                 f"{self.model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs."
@@ -820,7 +949,6 @@ class BaseTrainer:
                 if "bias" in fullname:  # bias (no decay)
                     g[2].append(param)
                 elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
-                    # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'
                     g[1].append(param)
                 else:  # weight (with decay)
                     g[0].append(param)
