@@ -475,6 +475,23 @@ class BaseTrainer:
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+                                
+                # 2. Unsupervised loss on pseudo-labeled data
+                unsupervised_loss = torch.tensor(0.0, device=self.device)
+                pseudo_labels = None
+                if target_batch_data is not None:
+                    pseudo_labels = target_batch_data.get('pseudo_labels', None)
+
+                if pseudo_labels is not None and len(pseudo_labels):
+                    # build a minimal “unlabeled” batch dict that YOLO expects
+                    ulb_batch = {
+                        'img': target_batch_data['img'],      # (B_unlabeled, C, H, W)
+                        'labels': pseudo_labels               # (M, 6) tensor of [batch_idx, cls, x, y, w, h]
+                    }
+                    with autocast(self.amp):
+                        unsup_loss_tensor, unsup_loss_items = self.model(ulb_batch)
+                    unsupervised_loss = unsup_loss_tensor.sum()
+
 
                 # Backward
                 self.scaler.scale(self.loss).backward()

@@ -49,7 +49,6 @@ teacher_ema_decay: 0.9998 # (float) EMA decay for teacher model
 peudo_label_conf: 0.5
 nms_conf: 0.25,
 nms_iou: 0.2
-unsup_weight: 0.5
 
 
 
