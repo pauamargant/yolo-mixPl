@@ -54,6 +54,7 @@ from ultralytics.utils.torch_utils import (
     torch_distributed_zero_first,
     unset_deterministic,
 )
+from ultralytics.utils.ops import non_max_suppression, xyxy2xywhn,xyxy2xywh
 
 
 class BaseTrainer:
@@ -291,12 +292,22 @@ class BaseTrainer:
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, rank=LOCAL_RANK, mode="train")
+        if self.target_trainset:
+            self.target_train_loader = self.get_dataloader(
+                self.target_trainset, batch_size=batch_size, rank=LOCAL_RANK, mode="train", augm_type ='weak'
+            )
+        
         if RANK in {-1, 0}:
             # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
             self.test_loader = self.get_dataloader(
                 self.testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
             )
             self.validator = self.get_validator()
+            if self.target_testset:
+                self.target_test_loader = self.get_dataloader(
+                    self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val"
+                )
+                self.target_validator =  self.get_validator(target_loader=True)
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             self.ema = ModelEMA(self.model)
@@ -322,6 +333,76 @@ class BaseTrainer:
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks("on_pretrain_routine_end")
 
+    def build_pseudo_batch(self,teacher_preds, target_imgs, nms_conf=0.25, nms_iou=0.45, pseudolabel_conf = 0.1,agnostic=False,max_det=300,device='cpu'):
+        """
+        Convert teacher model predictions into a pseudo-labeled batch dict for unsupervised loss.
+
+        Args:
+            teacher_preds (List[Tensor]): Raw outputs from the teacher model, length B, each (n,6) xyxy preds.
+            target_imgs (Tensor): Input images tensor of shape (B, C, H, W).
+            nms_conf (float): Confidence threshold for NMS.
+            nms_iou (float): IoU threshold for NMS.
+            agnostic (bool): Class-agnostic NMS.
+            max_det (int): Maximum detections per image.
+            device (str or torch.device): Device for tensors.
+
+        Returns:
+            dict: A batch dict with:
+                "img": target_imgs,
+                "labels": Tensor of shape (N,6) with columns [batch_idx, class, x, y, w, h].
+        """
+        # Run NMS on teacher predictions
+        results = non_max_suppression(
+            teacher_preds,
+            conf_thres=nms_conf,
+            iou_thres=nms_iou,
+            agnostic=agnostic,
+            max_det=max_det
+        )
+
+
+        bs, _, img_h, img_w = target_imgs.shape
+        batch_idxs, classes, bboxes = [], [], []
+
+        for batch_idx, det in enumerate(results):
+            if det is None or det.shape[0] == 0:
+                continue
+            # Filter out low-confidence detections
+            conf_mask = det[:, 4] >= pseudolabel_conf
+            det = det[conf_mask]
+            if det.shape[0] == 0:
+                continue
+            # Convert xyxy → xywh
+            xywh = xyxy2xywh(det[:, :4])  # (n,4)
+            # Normalize to [0,1]
+            xywh_norm = xywh.clone()
+            xywh_norm[:, 0] /= img_w  # x_center
+            xywh_norm[:, 1] /= img_h  # y_center
+            xywh_norm[:, 2] /= img_w  # width
+            xywh_norm[:, 3] /= img_h  # height
+            xywh_norm = xywh_norm.to(device)
+            # Class labels
+            cls = det[:, 5].long().to(device)
+
+            batch_idxs.append(torch.full((xywh_norm.size(0),), batch_idx, device=device, dtype=cls.dtype))
+            classes.append(cls)
+            bboxes.append(xywh_norm)
+
+        if batch_idxs:
+            batch_idx_tensor = torch.cat(batch_idxs, dim=0)
+            cls_tensor       = torch.cat(classes,   dim=0)
+            bboxes_tensor    = torch.cat(bboxes,    dim=0)
+        else:
+            batch_idx_tensor = torch.zeros((0,), dtype=torch.long, device=device)
+            cls_tensor       = torch.zeros((0,), dtype=torch.long, device=device)
+            bboxes_tensor    = torch.zeros((0,4), device=device)
+
+        return {
+            'img': target_imgs.to(device),
+            'batch_idx': batch_idx_tensor,
+            'cls': cls_tensor,
+            'bboxes': bboxes_tensor
+        }
     def _do_train(self, world_size=1):
         """Train the model with the specified world size."""
         if world_size > 1:
@@ -391,7 +472,48 @@ class BaseTrainer:
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+                # Pseudolableing target domain 
+                unsupervised_loss = torch.tensor(0.0, device=self.device) # Initialize unsupervised loss
+                num_loss_components = len(self.loss_items) if self.loss_items is not None else 3 # Example: box, cls, dfl
+                unsupervised_loss_items = torch.zeros(num_loss_components, device=self.device)
+                if self.target_train_loader:
+                    try:
+                        # Get the next batch from the target dataset iterator
+                        target_batch = next(target_iterator)
+                    except StopIteration:
+                        # If the target dataset is exhausted, reset the iterator
+                        target_iterator = iter(self.target_train_loader)
+                        target_batch = next(target_iterator)
+                    except NameError:
+                        # Initialize iterator if it doesn't exist (first epoch)
+                        target_iterator = iter(self.target_train_loader)
+                        target_batch = next(target_iterator)
+                    target_batch = self.preprocess_batch(target_batch)
+                    target_imgs = target_batch["img"].to(self.device)
 
+                    # self.teacher_model.ema.eval()
+                    with torch.no_grad(): # Disable gradients for teacher inference
+                        # Get raw predictions from the teacher model (EMA weights)
+                        # chec ktype of target_imgs
+                        
+                        teacher_preds = self.teacher_model.ema(target_imgs)
+
+                        pseudo_batch = self.build_pseudo_batch(
+                            teacher_preds=teacher_preds,
+                            target_imgs=target_imgs,
+                            nms_conf=self.args.nms_conf,
+                            nms_iou=self.args.nms_iou,
+                            pseudolabel_conf = self.args.pseudolabel_conf,
+                            device = self.device.type
+                        )
+
+                        u_loss, u_loss_items = self.model(pseudo_batch)
+                        unsupervised_loss = u_loss.sum()
+
+                self.loss = (1-0.5)*self.loss + 0.5*unsupervised_loss # Combine supervised and unsupervised loss
+
+                
+                # self.teacher_model.ema.train()
                 # Backward
                 self.scaler.scale(self.loss).backward()
 
@@ -440,17 +562,14 @@ class BaseTrainer:
                     self.metrics, self.fitness = self.validate()
 
                 #TODO: change when implemented target domain
-                if self.args.target_dataset:
+                if self.args.target_data:
                     print("Target Domain Validation")
                     LOGGER.info(f"Target domain validation...")
-                    # orig_loader = self.test_loader
-                    # self.test_loader = 
-                    tgt_metrics, _ = self.validate()
+                    tgt_metrics, _ = self.validate(target_data=True)
                     # prefix and merge
                     tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
                     self.metrics.update(tgt_metrics)
                     # Restore original loader
-                    # self.test_loader = orig_loader
                 # Target Domain validation 
 
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
@@ -497,6 +616,9 @@ class BaseTrainer:
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
+
+        
+    
 
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""
@@ -556,7 +678,9 @@ class BaseTrainer:
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
                 "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(self.ema.ema).half(),
+                "ema":  deepcopy(self.teacher_model.ema).half() if self.teacher_model else deepcopy(self.ema.ema).half(),
+                # "teacher_model": deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,
+                # "teacher_updates": self.teacher_model.updates  if self.teacher_model else None,
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "train_args": vars(self.args),  # save as dict
@@ -602,6 +726,8 @@ class BaseTrainer:
                 "obb",
             }:
                 target_data = check_det_dataset(self.args.target_data)
+                if "yaml_file" in target_data:
+                    self.args.target_data = target_data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
             else:
                 raise ValueError(f"Unsupported dataset format for target data: {self.args.target_data}")
 
@@ -645,6 +771,9 @@ class BaseTrainer:
             (dict): Optional checkpoint to resume training from.
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
+            if self.args.teacher_model: 
+                self.teacher_model = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
+                self.teacher_model.ema=self.teacher_model.ema.to(self.device)
             return
 
         cfg, weights = self.model, None
@@ -657,6 +786,7 @@ class BaseTrainer:
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         if self.args.teacher_model:
             self.teacher_model = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
+            self.teacher_model.ema=self.teacher_model.ema.to(self.device)
         return ckpt
 
     def optimizer_step(self):
@@ -675,14 +805,17 @@ class BaseTrainer:
         """Allows custom preprocessing model inputs and ground truths depending on task type."""
         return batch
 
-    def validate(self):
+    def validate(self, target_data=False):
         """
         Run validation on test set using self.validator.
 
         Returns:
             (tuple): A tuple containing metrics dictionary and fitness score.
         """
-        metrics = self.validator(self)
+        if target_data:
+            metrics = self.target_validator(self)
+        else:
+            metrics = self.validator(self)
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
@@ -696,7 +829,7 @@ class BaseTrainer:
         """Returns a NotImplementedError when the get_validator function is called."""
         raise NotImplementedError("get_validator function not implemented in trainer")
 
-    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train",augm_type='default'):
         """Returns dataloader derived from torch.data.Dataloader."""
         raise NotImplementedError("get_dataloader function not implemented in trainer")
 

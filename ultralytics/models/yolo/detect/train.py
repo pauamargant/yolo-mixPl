@@ -49,7 +49,7 @@ class DetectionTrainer(BaseTrainer):
         >>> trainer.train()
     """
 
-    def build_dataset(self, img_path, mode="train", batch=None):
+    def build_dataset(self, img_path, mode="train", batch=None,augm_type='supervised'):
         """
         Build YOLO Dataset for training or validation.
 
@@ -57,14 +57,17 @@ class DetectionTrainer(BaseTrainer):
             img_path (str): Path to the folder containing images.
             mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
             batch (int, optional): Size of batches, this is for `rect`.
+            augs_type (str): Type of dataset augmentations, can be supervised (default), weak or strong
 
         Returns:
             (Dataset): YOLO dataset object configured for the specified mode.
         """
-        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
 
-    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
+        
+        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, augm_type=augm_type)
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train", augm_type = 'default'):
         """
         Construct and return dataloader for the specified mode.
 
@@ -79,7 +82,7 @@ class DetectionTrainer(BaseTrainer):
         """
         assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
         with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-            dataset = self.build_dataset(dataset_path, mode, batch_size)
+            dataset = self.build_dataset(dataset_path, mode, batch_size,augm_type=augm_type)  # build dataset
         shuffle = mode == "train"
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
@@ -143,12 +146,17 @@ class DetectionTrainer(BaseTrainer):
             model.load(weights)
         return model
 
-    def get_validator(self):
+    def get_validator(self,target_loader = False):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
-        return yolo.detect.DetectionValidator(
-            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
-        )
+        if target_loader:
+            return yolo.detect.DetectionValidator(
+                        self.target_test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+            )
+        else:     
+            return yolo.detect.DetectionValidator(
+                self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+            )
 
     def label_loss_items(self, loss_items=None, prefix="train"):
         """

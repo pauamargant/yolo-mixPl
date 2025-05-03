@@ -24,6 +24,8 @@ from ultralytics.data.utils import IMG_FORMATS, PIN_MEMORY, VID_FORMATS
 from ultralytics.utils import RANK, colorstr
 from ultralytics.utils.checks import check_file
 
+import copy
+from types import SimpleNamespace
 
 class InfiniteDataLoader(dataloader.DataLoader):
     """
@@ -103,16 +105,45 @@ def seed_worker(worker_id):  # noqa
     random.seed(worker_seed)
 
 
-def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32, multi_modal=False):
+def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32, multi_modal=False,augm_type='default'):
     """Build and return a YOLO dataset based on configuration parameters."""
     dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
+    
+    cfg_dict = vars(cfg)
+
+    # Create a shallow copy to avoid modifying the original config
+    cfg_copy = copy.copy(cfg_dict)
+
+    if augm_type == 'weak':
+        # Apply weak augmentations by overriding base keys
+        weak_keys = [k for k in cfg_copy if 'weak' in k]
+        for k in weak_keys:
+            base_key = k.replace('weak', '')
+            cfg_copy[base_key] = cfg_copy[k]
+        dataset_cfg = SimpleNamespace(**cfg_copy)
+
+    elif augm_type == 'strong':
+        # Apply strong augmentations by overriding base keys
+        strong_keys = [k for k in cfg_copy if 'strong' in k]
+        for k in strong_keys:
+            base_key = k.replace('strong', '')
+            cfg_copy[base_key] = cfg_copy[k]
+        dataset_cfg = SimpleNamespace(**cfg_copy)
+
+    elif augm_type == 'default':
+        # Use the original config
+        dataset_cfg = cfg
+
+    else:
+        raise ValueError(f"Unknown augm_type: {augm_type}")
+
     return dataset(
         img_path=img_path,
         imgsz=cfg.imgsz,
         batch_size=batch,
-        augment=mode == "train",  # augmentation
-        hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
-        rect=cfg.rect or rect,  # rectangular batches
+        augment=mode == "train",
+        hyp=dataset_cfg,
+        rect=cfg.rect or rect,
         cache=cfg.cache or None,
         single_cls=cfg.single_cls or False,
         stride=int(stride),
@@ -123,7 +154,6 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
     )
-
 
 def build_grounding(cfg, img_path, json_file, batch, mode="train", rect=False, stride=32):
     """Build and return a GroundingDataset based on configuration parameters."""

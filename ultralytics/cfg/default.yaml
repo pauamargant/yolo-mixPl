@@ -46,8 +46,8 @@ dropout: 0.0 # (float) use dropout regularization (classify train only)
 
 # Mean Taeacher
 teacher_ema_decay: 0.9998 # (float) EMA decay for teacher model
-peudo_label_conf: 0.5
-nms_conf: 0.25,
+pseudolabel_conf: 0.5
+nms_conf: 0.25
 nms_iou: 0.2
 teacher_model: True
 
@@ -129,6 +129,31 @@ copy_paste: 0.0 # (float) segment copy-paste (probability)
 copy_paste_mode: "flip" # (str) the method to do copy_paste augmentation (flip, mixup)
 auto_augment: randaugment # (str) auto augmentation policy for classification (randaugment, autoaugment, augmix)
 erasing: 0.4 # (float) probability of random erasing during classification training (0-0.9), 0 means no erasing, must be less than 1.0.
+
+# --- Weak Augment Hyperparameters ---
+weak_hsv_h: 0.0          # no HSV hue jitter
+weak_hsv_s: 0.0          # no HSV saturation jitter
+weak_hsv_v: 0.0          # no HSV value jitter
+
+weak_degrees:   0.0      # no rotation
+weak_translate: 0.0      # no translation
+weak_scale:     0.5     # no random scaling (resize done externally)
+weak_shear:     0.0      # no shear
+weak_perspective: 0.0    # no perspective warp
+
+weak_flipud:    0.5      # no up-down flip
+weak_fliplr:    0.5      # 50% left-right flip (matches RandomFlip)
+
+weak_bgr:       0.0      # no channel swap
+
+weak_mosaic:    0.0      # mosaic off
+weak_mixup:     0.0      # mixup off
+weak_cutmix:    0.0      # cutmix off
+weak_copy_paste: 0.0      # segment copy-paste off
+weak_copy_paste_mode: "flip"  # irrelevant when copy_paste=0
+
+weak_auto_augment: ""    # no auto-augment policy
+weak_erasing:    0.0     # no random erasing
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) for overriding defaults.yaml
