@@ -300,19 +300,19 @@ class BaseTrainer:
         if RANK in {-1, 0}:
             # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
             self.test_loader = self.get_dataloader(
-                self.target_testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
+                self.testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
             )
             self.validator = self.get_validator()
-            # if self.target_testset:
-            #     self.target_test_loader = self.get_dataloader(
-            #         self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val"
-            #     )
-            #     self.target_validator =  self.get_validator(target_loader=True)
+            if self.target_testset:
+                # Ensure target_test_loader uses the target dataset configuration
+                self.target_test_loader = self.get_dataloader(
+                    self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val", data_config=self.target_data
+                )
+                # Ensure target_validator uses the target dataset configuration (handled in get_validator subclass)
+                self.target_validator =  self.get_validator(target_loader=True)
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             self.ema = ModelEMA(self.model)
-            if self.args.plots:
-                self.plot_training_labels()
 
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
@@ -561,14 +561,14 @@ class BaseTrainer:
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
 
-                # #TODO: change when implemented target domain
-                # if self.args.target_data:
-                #     print("Target Domain Validation")
-                #     LOGGER.info(f"Target domain validation...")
-                #     tgt_metrics, _ = self.validate(target_data=True)
-                #     # prefix and merge
-                #     tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
-                #     self.metrics.update(tgt_metrics)
+                #TODO: change when implemented target domain
+                if self.args.target_data:
+                    print("Target Domain Validation")
+                    LOGGER.info(f"Target domain validation...")
+                    tgt_metrics, _ = self.validate(target_data=True)
+                    # prefix and merge
+                    tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
+                    self.metrics.update(tgt_metrics)
                     # Restore original loader
                 # Target Domain validation 
 
