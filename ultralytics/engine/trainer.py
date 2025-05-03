@@ -300,12 +300,12 @@ class BaseTrainer:
         if RANK in {-1, 0}:
             # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
             self.test_loader = self.get_dataloader(
-                self.testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
+                self.target_testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
             )
             self.validator = self.get_validator()
             if self.target_testset:
                 self.target_test_loader = self.get_dataloader(
-                    self.target_testset, batch_size=batch_size, rank=-1, mode="val"
+                    self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val"
                 )
                 self.target_validator =  self.get_validator(target_loader=True)
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
@@ -561,14 +561,14 @@ class BaseTrainer:
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
 
-                #TODO: change when implemented target domain
-                if self.args.target_data:
-                    print("Target Domain Validation")
-                    LOGGER.info(f"Target domain validation...")
-                    tgt_metrics, _ = self.validate(target_data=True)
-                    # prefix and merge
-                    tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
-                    self.metrics.update(tgt_metrics)
+                # #TODO: change when implemented target domain
+                # if self.args.target_data:
+                #     print("Target Domain Validation")
+                #     LOGGER.info(f"Target domain validation...")
+                #     tgt_metrics, _ = self.validate(target_data=True)
+                #     # prefix and merge
+                #     tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
+                #     self.metrics.update(tgt_metrics)
                     # Restore original loader
                 # Target Domain validation 
 
