@@ -305,7 +305,7 @@ class BaseTrainer:
             self.validator = self.get_validator()
             if self.target_testset:
                 self.target_test_loader = self.get_dataloader(
-                    self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val"
+                    self.target_testset, batch_size=batch_size, rank=-1, mode="val"
                 )
                 self.target_validator =  self.get_validator(target_loader=True)
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
