@@ -103,6 +103,7 @@ class BaseTrainer:
             overrides (dict, optional): Configuration overrides. Defaults to None.
             _callbacks (list, optional): List of callback functions. Defaults to None.
         """
+        print("STAARTING")
         self.args = get_cfg(cfg, overrides)
         self.check_resume(overrides)
         self.device = select_device(self.args.device, self.args.batch)
