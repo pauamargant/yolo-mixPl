@@ -306,7 +306,7 @@ class BaseTrainer:
             if self.target_testset:
                 # Ensure target_test_loader uses the target dataset configuration
                 self.target_test_loader = self.get_dataloader(
-                    self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val", data_config=self.target_data
+                    self.target_testset, batch_size=batch_size, rank=LOCAL_RANK, mode="val"
                 )
                 # Ensure target_validator uses the target dataset configuration (handled in get_validator subclass)
                 self.target_validator =  self.get_validator(target_loader=True)

@@ -49,7 +49,7 @@ class DetectionTrainer(BaseTrainer):
         >>> trainer.train()
     """
 
-    def build_dataset(self, img_path, mode="train", batch=None,augm_type='supervised'):
+    def build_dataset(self, img_path, mode="train", batch=None,augm_type='default'):
         """
         Build YOLO Dataset for training or validation.
 
