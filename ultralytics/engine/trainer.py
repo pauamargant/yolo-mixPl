@@ -56,6 +56,7 @@ from ultralytics.utils.torch_utils import (
 )
 from ultralytics.utils.ops import non_max_suppression, xyxy2xywhn,xyxy2xywh
 
+import albumentations as A
 
 class BaseTrainer:
     """
@@ -334,25 +335,28 @@ class BaseTrainer:
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks("on_pretrain_routine_end")
 
-    def build_pseudo_batch(self,teacher_preds, target_imgs, nms_conf=0.25, nms_iou=0.45, pseudolabel_conf = 0.1,agnostic=False,max_det=300,device='cpu'):
+    def build_pseudo_batch(
+        self,
+        teacher_preds,
+        target_imgs,
+        nms_conf=0.25,
+        nms_iou=0.45,
+        pseudolabel_conf=0.1,
+        agnostic=False,
+        max_det=300,
+        device='cpu'
+        ):
         """
-        Convert teacher model predictions into a pseudo-labeled batch dict for unsupervised loss.
-
-        Args:
-            teacher_preds (List[Tensor]): Raw outputs from the teacher model, length B, each (n,6) xyxy preds.
-            target_imgs (Tensor): Input images tensor of shape (B, C, H, W).
-            nms_conf (float): Confidence threshold for NMS.
-            nms_iou (float): IoU threshold for NMS.
-            agnostic (bool): Class-agnostic NMS.
-            max_det (int): Maximum detections per image.
-            device (str or torch.device): Device for tensors.
+        Convert teacher model predictions into a pseudo-labeled, augmented batch dict.
 
         Returns:
-            dict: A batch dict with:
-                "img": target_imgs,
-                "labels": Tensor of shape (N,6) with columns [batch_idx, class, x, y, w, h].
+            dict with keys:
+                - 'img': Tensor [B, C, H, W] of augmented images
+                - 'batch_idx': LongTensor [N] of batch indices
+                - 'cls': LongTensor    [N] of class labels
+                - 'bboxes': Tensor     [N,4] of normalized xywh boxes
         """
-        # Run NMS on teacher predictions
+        # 1) NMS on teacher preds
         results = non_max_suppression(
             teacher_preds,
             conf_thres=nms_conf,
@@ -361,48 +365,127 @@ class BaseTrainer:
             max_det=max_det
         )
 
-
         bs, _, img_h, img_w = target_imgs.shape
+
+        # 2) Build an Albumentations Compose matching your strong_pipeline
+        strong_transform = A.Compose(
+            [
+                # # — weak parts are already handled upstream, so we just ensure the same resize+flip —
+                # A.Resize(img_h, img_w, interpolation=1),  # like RandomResize
+                # A.HorizontalFlip(p=0.5),                  # like RandomFlip
+
+                # one random color op
+                A.OneOf(
+                    [
+                        A.CLAHE(p=1.0),                   # ≈ AutoContrast
+                        A.Equalize(p=1.0),                # Equalize
+                        A.RandomBrightnessContrast(p=1.0),# Brightness/Contrast
+                        A.Sharpen(p=1.0),                 # Sharpness
+                        A.Posterize(num_bits=4, p=1.0),   # Posterize
+                        A.Solarize(p=1.0), # Solarize
+                        A.HueSaturationValue(p=1.0),      # ColorTransform
+                    ],
+                    p=1.0,
+                ),
+
+                # one random geometric op
+                A.OneOf(
+                    [
+                        A.Rotate(limit=30, p=1.0),                     # Rotate
+                        A.Affine(shear={'x':(-20,20)}, p=1.0),         # ShearX
+                        A.Affine(shear={'y':(-20,20)}, p=1.0),         # ShearY
+                        A.Affine(translate_percent={'x':(-0.1,0.1)}, p=1.0),  # TranslateX
+                        A.Affine(translate_percent={'y':(-0.1,0.1)}, p=1.0),  # TranslateY
+                    ],
+                    p=1.0,
+                ),
+
+                # (optionally uncomment for random erasing)
+                # A.CoarseDropout(max_holes=5, max_height=int(0.2*img_h),
+                #                 max_width=int(0.2*img_w), p=0.5),
+            ],
+            bbox_params=A.BboxParams(
+                format='yolo',            # normalized xywh
+                label_fields=['labels'],
+                filter_invalid_bboxes=True,
+                check_each_transform=False   # clamp only at the end
+
+            )
+        )
+
+        images_aug = []
         batch_idxs, classes, bboxes = [], [], []
 
-        for batch_idx, det in enumerate(results):
+        # 3) Loop per-image: filter pseudo-labels, then augment
+        for batch_idx, (img_tensor, det) in enumerate(zip(target_imgs, results)):
+            # --- filter pseudo-labels as before ---
             if det is None or det.shape[0] == 0:
-                continue
-            # Filter out low-confidence detections
-            conf_mask = det[:, 4] >= pseudolabel_conf
-            det = det[conf_mask]
-            if det.shape[0] == 0:
-                continue
-            # Convert xyxy → xywh
-            xywh = xyxy2xywh(det[:, :4])  # (n,4)
-            # Normalize to [0,1]
-            xywh_norm = xywh.clone()
-            xywh_norm[:, 0] /= img_w  # x_center
-            xywh_norm[:, 1] /= img_h  # y_center
-            xywh_norm[:, 2] /= img_w  # width
-            xywh_norm[:, 3] /= img_h  # height
-            xywh_norm = xywh_norm.to(device)
-            # Class labels
-            cls = det[:, 5].long().to(device)
+                bboxes_list, labels_list = [], []
+            else:
+                mask = det[:, 4] >= pseudolabel_conf
+                det = det[mask]
+                if det.shape[0] == 0:
+                    bboxes_list, labels_list = [], []
+                else:
+                    xywh = xyxy2xywh(det[:, :4])
+                    # normalize
+                    xywh[:, 0] /= img_w; xywh[:, 1] /= img_h
+                    xywh[:, 2] /= img_w; xywh[:, 3] /= img_h
+                    bboxes_list = [tuple(x.tolist()) for x in xywh]
+                    labels_list = det[:, 5].long().tolist()
 
-            batch_idxs.append(torch.full((xywh_norm.size(0),), batch_idx, device=device, dtype=cls.dtype))
-            classes.append(cls)
-            bboxes.append(xywh_norm)
+            # --- prepare image for Albumentations (HWC uint8) ---
+            img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+            # if your imgs are floats [0,1]:
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).round().astype(np.uint8)
+
+            # --- apply the strong pipeline ---
+            augmented = strong_transform(
+                image=img_np,
+                bboxes=bboxes_list,
+                labels=labels_list
+            )
+
+            # --- collect augmented image ---
+            img_aug = augmented['image']
+            # back to CHW float [0,1]
+            img_aug_tensor = (
+                torch.from_numpy(img_aug)
+                .permute(2, 0, 1)
+                .to(device)
+                .float()
+                .div(255.0)
+            )
+            images_aug.append(img_aug_tensor.unsqueeze(0))
+
+            # --- collect any augmented bboxes/labels ---
+            for lbl, box in zip(augmented['labels'], augmented['bboxes']):
+                batch_idxs.append(batch_idx)
+                classes.append(lbl)
+                bboxes.append(box)
+
+        # 4) stack everything and return
+        if images_aug:
+            imgs_tensor = torch.cat(images_aug, dim=0)  # [B, C, H, W]
+        else:
+            # fallback to original
+            imgs_tensor = target_imgs.to(device)
 
         if batch_idxs:
-            batch_idx_tensor = torch.cat(batch_idxs, dim=0)
-            cls_tensor       = torch.cat(classes,   dim=0)
-            bboxes_tensor    = torch.cat(bboxes,    dim=0)
+            batch_idx_tensor = torch.tensor(batch_idxs, dtype=torch.long, device=device)
+            cls_tensor       = torch.tensor(classes,   dtype=torch.long, device=device)
+            bboxes_tensor    = torch.tensor(bboxes,    dtype=torch.float, device=device)
         else:
             batch_idx_tensor = torch.zeros((0,), dtype=torch.long, device=device)
             cls_tensor       = torch.zeros((0,), dtype=torch.long, device=device)
-            bboxes_tensor    = torch.zeros((0,4), device=device)
+            bboxes_tensor    = torch.zeros((0, 4), dtype=torch.float, device=device)
 
         return {
-            'img': target_imgs.to(device),
+            'img':       imgs_tensor,
             'batch_idx': batch_idx_tensor,
-            'cls': cls_tensor,
-            'bboxes': bboxes_tensor
+            'cls':       cls_tensor,
+            'bboxes':    bboxes_tensor,
         }
     def _do_train(self, world_size=1):
         """Train the model with the specified world size."""
