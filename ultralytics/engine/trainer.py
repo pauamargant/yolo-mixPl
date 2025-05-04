@@ -575,7 +575,6 @@ class BaseTrainer:
                     target_batch = self.preprocess_batch(target_batch)
                     target_imgs = target_batch["img"].to(self.device)
 
-                    # self.teacher_model.ema.eval()
                     with torch.no_grad(): # Disable gradients for teacher inference
                         # Get raw predictions from the teacher model (EMA weights)
                         # chec ktype of target_imgs
@@ -588,16 +587,15 @@ class BaseTrainer:
                             nms_conf=self.args.nms_conf,
                             nms_iou=self.args.nms_iou,
                             pseudolabel_conf = self.args.pseudolabel_conf,
-                            device = self.device.type
+                            device = self.device
                         )
 
                         u_loss, u_loss_items = self.model(pseudo_batch)
                         unsupervised_loss = u_loss.sum()
 
-                self.loss = (1-0.5)*self.loss + 0.5*unsupervised_loss # Combine supervised and unsupervised loss
+                self.loss = (1-self.args.loss_mix_ratio)*self.loss + self.args.loss_mix_ratio*unsupervised_loss # Combine supervised and unsupervised loss
 
                 
-                # self.teacher_model.ema.train()
                 # Backward
                 self.scaler.scale(self.loss).backward()
 
@@ -643,13 +641,12 @@ class BaseTrainer:
 
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                    self.metrics, self.fitness = self.validate()
+                    self.metrics, _ = self.validate()
 
-                #TODO: change when implemented target domain
                 if self.args.target_data:
                     print("Target Domain Validation")
                     LOGGER.info(f"Target domain validation...")
-                    tgt_metrics, _ = self.validate(target_data=True)
+                    tgt_metrics, self.fitness = self.validate(target_data=True)
                     # prefix and merge
                     tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
                     self.metrics.update(tgt_metrics)
@@ -858,6 +855,8 @@ class BaseTrainer:
             if self.args.teacher_model: 
                 self.teacher_model = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
                 self.teacher_model.ema=self.teacher_model.ema.to(self.device)
+                self.teacher_model.ema.eval()
+
             return
 
         cfg, weights = self.model, None
@@ -871,6 +870,8 @@ class BaseTrainer:
         if self.args.teacher_model:
             self.teacher_model = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
             self.teacher_model.ema=self.teacher_model.ema.to(self.device)
+            self.teacher_model.ema.eval()
+
         return ckpt
 
     def optimizer_step(self):
