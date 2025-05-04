@@ -1027,5 +1027,6 @@ def copy_default_cfg() -> None:
 
 
 if __name__ == "__main__":
+    print("Ultralytics CLI entrypoint")
     # Example: entrypoint(debug='yolo predict model=yolo11n.pt')
     entrypoint(debug="")
