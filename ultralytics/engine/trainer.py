@@ -122,6 +122,7 @@ class BaseTrainer:
             self.args.save_dir = str(self.save_dir)
             yaml_save(self.save_dir / "args.yaml", vars(self.args))  # save run args
         self.last, self.best = self.wdir / "last.pt", self.wdir / "best.pt"  # checkpoint paths
+        self.source_best = self.wdir / 'source_best.pt'
         self.save_period = self.args.save_period
 
         self.batch_size = self.args.batch
@@ -143,13 +144,17 @@ class BaseTrainer:
 
         self.ema = None
 
+
+
         # Optimization utils init
         self.lf = None
         self.scheduler = None
 
         # Epoch level metrics
         self.best_fitness = None
+        self.best_target_fitness = None
         self.fitness = None
+        self.target_fitness = None
         self.loss = None
         self.tloss = None
         self.loss_names = ["Loss"]
@@ -547,15 +552,19 @@ class BaseTrainer:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
                 # Forward
-                with autocast(self.amp):
-                    batch = self.preprocess_batch(batch)
-                    loss, self.loss_items = self.model(batch)
-                    self.loss = loss.sum()
-                    if RANK != -1:
-                        self.loss *= world_size
-                    self.tloss = (
-                        (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
-                    )
+                if self.args.loss_mix_ratio<1:
+                    with autocast(self.amp):
+                        batch = self.preprocess_batch(batch)
+                        loss, self.loss_items = self.model(batch)
+                        self.loss = loss.sum()
+                        if RANK != -1:
+                            self.loss *= world_size
+                        self.tloss = (
+                            (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
+                        )
+                else:
+                    self.loss = torch.tensor(0.0, device=self.device) # Initialize supervised loss
+                    self.tloss = torch.zeros(3, device=self.device) # Initialize supervised loss items
                 # Pseudolableing target domain 
                 unsupervised_loss = torch.tensor(0.0, device=self.device) # Initialize unsupervised loss
                 num_loss_components = len(self.loss_items) if self.loss_items is not None else 3 # Example: box, cls, dfl
@@ -641,12 +650,12 @@ class BaseTrainer:
 
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                    self.metrics, _ = self.validate()
+                    self.metrics, self.fitness = self.validate()
 
                 if self.args.target_data:
                     print("Target Domain Validation")
                     LOGGER.info(f"Target domain validation...")
-                    tgt_metrics, self.fitness = self.validate(target_data=True)
+                    tgt_metrics, self.target_fitness = self.validate(target_data=True)
                     # prefix and merge
                     tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
                     self.metrics.update(tgt_metrics)
@@ -753,7 +762,7 @@ class BaseTrainer:
         import io
 
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
-        buffer = io.BytesIO()
+        buffer_teacher = io.BytesIO()
         torch.save(
             {
                 "epoch": self.epoch,
@@ -765,25 +774,25 @@ class BaseTrainer:
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
+                "train_metrics": {**self.metrics, **{"fitness": self.target_fitness}},
                 "train_results": self.read_results_csv(),
                 "date": datetime.now().isoformat(),
                 "version": __version__,
                 "license": "AGPL-3.0 (https://ultralytics.com/license)",
                 "docs": "https://docs.ultralytics.com",
             },
-            buffer,
+            buffer_teacher,
         )
-        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
+        serialized_ckpt_teacher = buffer_teacher.getvalue()  # get the serialized content to save
 
         # Save checkpoints
-        self.last.write_bytes(serialized_ckpt)  # save last.pt
-        if self.best_fitness == self.fitness:
-            self.best.write_bytes(serialized_ckpt)  # save best.pt
+        self.last.write_bytes(serialized_ckpt_teacher)  # save last.pt
+        if self.best_target_fitness <= self.target_fitness:
+            self.best.write_bytes(serialized_ckpt_teacher)  # save best.pt
+        if self.best_fitness <= self.fitness:
+            self.source_best.write_bytes(serialized_ckpt_teacher)
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
-        # if self.args.close_mosaic and self.epoch == (self.epochs - self.args.close_mosaic - 1):
-        #    (self.wdir / "last_mosaic.pt").write_bytes(serialized_ckpt)  # save mosaic checkpoint
+            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt_teacher)  # save epoch, i.e. 'epoch3.pt'
     def _get_target_dataset(self):
         """
         Get train and validation datasets from the target data source specified in args.target_data.
@@ -897,13 +906,20 @@ class BaseTrainer:
         Returns:
             (tuple): A tuple containing metrics dictionary and fitness score.
         """
+        if self.teacher_model:
+            student=self.model
+            self.model = self.teacher_model.ema
         if target_data:
             metrics = self.target_validator(self)
         else:
             metrics = self.validator(self)
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        if not self.best_fitness or self.best_fitness < fitness:
+        if not target_data and (not self.best_fitness or self.best_fitness < fitness):
             self.best_fitness = fitness
+        if target_data and (not self.best_target_fitness or self.best_target_fitness < fitness):
+            self.best_target_fitness = fitness
+        if self.teacher_model:
+            self.model = student
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
