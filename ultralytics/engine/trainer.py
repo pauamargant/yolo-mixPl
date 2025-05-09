@@ -138,11 +138,11 @@ class BaseTrainer:
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
         self.teacher_model = None
+        self.ema = None
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.trainset, self.testset = self.get_dataset()
             self.target_trainset, self.target_testset = self._get_target_dataset()
 
-        self.ema = None
 
 
 
@@ -157,6 +157,7 @@ class BaseTrainer:
         self.target_fitness = None
         self.loss = None
         self.tloss = None
+        self.u_tloss = None
         self.loss_names = ["Loss"]
         self.csv = self.save_dir / "results.csv"
         self.plot_idx = [0, 1, 2]
@@ -319,7 +320,6 @@ class BaseTrainer:
                 self.target_validator =  self.get_validator(target_loader=True)
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            self.ema = ModelEMA(self.model)
 
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
@@ -396,7 +396,7 @@ class BaseTrainer:
                 # one random geometric op
                 A.OneOf(
                     [
-                        A.Rotate(limit=30, p=1.0),                     # Rotate
+                        A.Rotate(limit=15, p=1.0),                     # Rotate
                         A.Affine(shear={'x':(-20,20)}, p=1.0),         # ShearX
                         A.Affine(shear={'y':(-20,20)}, p=1.0),         # ShearY
                         A.Affine(translate_percent={'x':(-0.1,0.1)}, p=1.0),  # TranslateX
@@ -589,18 +589,21 @@ class BaseTrainer:
                         # chec ktype of target_imgs
                         
                         teacher_preds = self.teacher_model.ema(target_imgs)
-
-                        pseudo_batch = self.build_pseudo_batch(
-                            teacher_preds=teacher_preds,
-                            target_imgs=target_imgs,
-                            nms_conf=self.args.nms_conf,
-                            nms_iou=self.args.nms_iou,
-                            pseudolabel_conf = self.args.pseudolabel_conf,
-                            device = self.device
-                        )
-
+                    
+                    pseudo_batch = self.build_pseudo_batch(
+                        teacher_preds=teacher_preds,
+                        target_imgs=target_imgs,
+                        nms_conf=self.args.nms_conf,
+                        nms_iou=self.args.nms_iou,
+                        pseudolabel_conf = self.args.pseudolabel_conf,
+                        device = self.device
+                    )
+                    with autocast(self.amp):
                         u_loss, u_loss_items = self.model(pseudo_batch)
                         unsupervised_loss = u_loss.sum()
+                        self.u_tloss = (
+                            (self.u_tloss * i + u_loss_items) / (i + 1) if self.u_tloss is not None else u_loss_items
+                        )
 
                 self.loss = (1-self.args.loss_mix_ratio)*self.loss + self.args.loss_mix_ratio*unsupervised_loss # Combine supervised and unsupervised loss
 
@@ -646,7 +649,7 @@ class BaseTrainer:
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 final_epoch = epoch + 1 >= self.epochs
-                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+                self.teacher_model.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
@@ -768,10 +771,10 @@ class BaseTrainer:
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
                 "model": None,  # resume and final checkpoints derive from EMA
-                "ema":  deepcopy(self.teacher_model.ema).half() if self.teacher_model else deepcopy(self.ema.ema).half(),
+                "ema":  deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,
                 # "teacher_model": deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,
                 # "teacher_updates": self.teacher_model.updates  if self.teacher_model else None,
-                "updates": self.ema.updates,
+                "updates": self.teacher_model.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "train_args": vars(self.args),  # save as dict
                 "train_metrics": {**self.metrics, **{"fitness": self.target_fitness}},
@@ -890,8 +893,6 @@ class BaseTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
-        if self.ema:
-            self.ema.update(self.model)
         if self.teacher_model:
             self.teacher_model.update(self.model)
 
@@ -1043,9 +1044,6 @@ class BaseTrainer:
         if ckpt.get("optimizer", None) is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])  # optimizer
             best_fitness = ckpt["best_fitness"]
-        if self.ema and ckpt.get("ema"):
-            self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())  # EMA
-            self.ema.updates = ckpt["updates"]
         assert start_epoch > 0, (
             f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
             f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
