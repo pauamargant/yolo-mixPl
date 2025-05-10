@@ -344,8 +344,7 @@ class BaseTrainer:
         self,
         teacher_preds,
         target_imgs,
-        nms_conf=0.25,
-        nms_iou=0.45,
+        nms_iou=0.45, 
         pseudolabel_conf=0.1,
         agnostic=False,
         max_det=300,
@@ -364,7 +363,7 @@ class BaseTrainer:
         # 1) NMS on teacher preds
         results = non_max_suppression(
             teacher_preds,
-            conf_thres=nms_conf,
+            conf_thres=pseudolabel_conf,
             iou_thres=nms_iou,
             agnostic=agnostic,
             max_det=max_det
@@ -594,8 +593,6 @@ class BaseTrainer:
                     pseudo_batch = self.build_pseudo_batch(
                         teacher_preds=teacher_preds,
                         target_imgs=target_imgs,
-                        nms_conf=self.args.nms_conf,
-                        nms_iou=self.args.nms_iou,
                         pseudolabel_conf = self.args.pseudolabel_conf,
                         device = self.device
                     )
@@ -643,6 +640,8 @@ class BaseTrainer:
                     self.run_callbacks("on_batch_end")
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
+                        self.plot_training_samples(pseudo_batch, ni)
+                        
 
                 self.run_callbacks("on_train_batch_end")
 

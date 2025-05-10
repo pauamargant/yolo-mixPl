@@ -199,7 +199,7 @@ class DetectionTrainer(BaseTrainer):
             batch_idx=batch["batch_idx"],
             cls=batch["cls"].squeeze(-1),
             bboxes=batch["bboxes"],
-            paths=batch["im_file"],
+            paths= batch.get("im_files"),
             fname=self.save_dir / f"train_batch{ni}.jpg",
             on_plot=self.on_plot,
         )
