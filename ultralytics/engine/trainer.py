@@ -157,6 +157,8 @@ class BaseTrainer:
         self.target_fitness = None
         self.loss = None
         self.tloss = None
+        self.s_loss = None
+        self.u_loss = None
         self.u_tloss = None
         self.loss_names = ["Loss"]
         self.csv = self.save_dir / "results.csv"
@@ -535,6 +537,8 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            self.u_tloss = None
+            self.s_tloss = None
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -554,21 +558,20 @@ class BaseTrainer:
                 if self.args.loss_mix_ratio<1:
                     with autocast(self.amp):
                         batch = self.preprocess_batch(batch)
-                        loss, self.loss_items = self.model(batch)
-                        self.loss = loss.sum()
+                        loss, self.s_loss_items = self.model(batch)
+                        self.s_loss = loss.sum()
                         if RANK != -1:
-                            self.loss *= world_size
-                        self.tloss = (
-                            (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
+                            self.s_loss *= world_size
+                        self.s_tloss = (
+                            (self.s_tloss * i + self.s_loss_items) / (i + 1) if self.s_tloss is not None else self.s_loss_items
                         )
                 else:
-                    self.loss = torch.tensor(0.0, device=self.device) # Initialize supervised loss
-                    self.tloss = torch.zeros(3, device=self.device) # Initialize supervised loss items
-                    self.loss_items = torch.zeros(3, device=self.device) # Initialize supervised loss items
+                    self.s_loss = torch.tensor(0.0, device=self.device) # Initialize supervised loss
+                    self.s_tloss = torch.zeros(3, device=self.device) # Initialize supervised loss items
+                    self.s_loss_items = torch.zeros(3, device=self.device) # Initialize supervised loss items
+
+                    
                 # Pseudolableing target domain 
-                unsupervised_loss = torch.tensor(0.0, device=self.device) # Initialize unsupervised loss
-                num_loss_components = len(self.loss_items) if self.loss_items is not None else 3 # Example: box, cls, dfl
-                unsupervised_loss_items = torch.zeros(num_loss_components, device=self.device)
                 if self.target_train_loader:
                     try:
                         # Get the next batch from the target dataset iterator
@@ -597,15 +600,22 @@ class BaseTrainer:
                         device = self.device
                     )
                     with autocast(self.amp):
-                        u_loss, u_loss_items = self.model(pseudo_batch)
-                        unsupervised_loss = u_loss.sum()
+                        u_loss, self.u_loss_items = self.model(pseudo_batch)
+                        self.u_loss = u_loss.sum()
                         self.u_tloss = (
-                            (self.u_tloss * i + u_loss_items) / (i + 1) if self.u_tloss is not None else u_loss_items
+                            (self.u_tloss * i + self.u_loss_items) / (i + 1) if self.u_tloss is not None else self.u_loss_items
                         )
-
-                self.loss = (1-self.args.loss_mix_ratio)*self.loss + self.args.loss_mix_ratio*unsupervised_loss # Combine supervised and unsupervised loss
-
-                
+                else:
+                    self.u_loss = torch.tensor(0.0, device=self.device) # Initialize unsupervised loss
+                    self.u_tloss = torch.zeros(3, device=self.device) # Initialize unsupervised loss items
+                    self.u_loss_items = torch.zeros(3, device=self.device) # Initialize unsupervised loss items
+                # Combine supervised and unsupervised loss
+                self.loss = self.s_loss + self.args.loss_mix_ratio * self.u_loss
+                # sum loss items
+                self.loss_items = self.s_loss_items + self.args.loss_mix_ratio * self.u_loss_items
+                self.tloss = (
+                    (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
+                )                    
                 # Backward
                 self.scaler.scale(self.loss).backward()
 
