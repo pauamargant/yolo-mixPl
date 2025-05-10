@@ -425,7 +425,7 @@ class BaseTrainer:
         for batch_idx, (img_tensor, det) in enumerate(zip(target_imgs, results)):
             # --- filter pseudo-labels as before ---
             if det is None or det.shape[0] == 0:
-                bboxes_list, labels_list = [], []
+                continue
             else:
                 mask = det[:, 4] >= pseudolabel_conf
                 det = det[mask]
@@ -565,6 +565,7 @@ class BaseTrainer:
                 else:
                     self.loss = torch.tensor(0.0, device=self.device) # Initialize supervised loss
                     self.tloss = torch.zeros(3, device=self.device) # Initialize supervised loss items
+                    self.loss_items = torch.zeros(3, device=self.device) # Initialize supervised loss items
                 # Pseudolableing target domain 
                 unsupervised_loss = torch.tensor(0.0, device=self.device) # Initialize unsupervised loss
                 num_loss_components = len(self.loss_items) if self.loss_items is not None else 3 # Example: box, cls, dfl
@@ -770,8 +771,8 @@ class BaseTrainer:
             {
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema":  deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,
+                "model": deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,  # resume and final checkpoints derive from EMA
+                "ema":  None,
                 # "teacher_model": deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,
                 # "teacher_updates": self.teacher_model.updates  if self.teacher_model else None,
                 "updates": self.teacher_model.updates,
