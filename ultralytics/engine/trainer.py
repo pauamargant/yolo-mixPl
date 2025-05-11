@@ -931,9 +931,9 @@ class BaseTrainer:
         Returns:
             (tuple): A tuple containing metrics dictionary and fitness score.
         """
-        if self.ema:
-            student=self.model
-            self.model = self.ema.ema
+        # if self.ema:
+        #     student=self.model
+        #     self.model = self.ema.ema
         if target_data:
             metrics = self.target_validator(self)
         else:
@@ -943,8 +943,8 @@ class BaseTrainer:
             self.best_fitness = fitness
         if target_data and (not self.best_target_fitness or self.best_target_fitness < fitness):
             self.best_target_fitness = fitness
-        if self.ema:
-            self.model = student
+        # if self.ema:
+        #     self.model = student
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
