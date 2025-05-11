@@ -645,8 +645,6 @@ class BaseTrainer:
                             *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
                             batch["cls"].shape[0],  # batch size, i.e. 8
                             batch["img"].shape[-1],  # imgsz, i.e 640
-                            *(self.u_tloss if loss_length > 1 else torch.unsqueeze(self.u_tloss, 0)),
-                            *(self.s_tloss if loss_length > 1 else torch.unsqueeze(self.s_tloss, 0)),  # supervised loss
                         )
                     )
                     self.run_callbacks("on_batch_end")
@@ -889,7 +887,7 @@ class BaseTrainer:
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
             if self.args.teacher_model: 
-                self.ema = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
+                self.ema = ModelEMA(self.model,decay = self.args.teacher_ema_decay, tau=1)
                 self.ema.ema=self.ema.ema.to(self.device)
                 self.ema.ema.eval()
 
