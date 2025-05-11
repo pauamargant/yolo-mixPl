@@ -650,7 +650,8 @@ class BaseTrainer:
                     self.run_callbacks("on_batch_end")
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
-                        self.plot_training_samples(pseudo_batch, ni)
+                        if self.args.u_lambda>0:
+                            self.plot_training_samples(pseudo_batch, ni)
                 if self.args.batch_len > 0 and i%self.args.batch_len == 0: 
                     LOGGER.info(
                         f"Train {epoch}/{self.epochs} "
