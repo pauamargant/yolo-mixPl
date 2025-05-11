@@ -52,8 +52,7 @@ teacher_model: True
 s_lambda: 1 # (float) loss mix ratio for teacher model
 u_lambda: 1 # (float) loss mix ratio for student model
 save_student: False
-
-
+batch_len: 50
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) validate/test during training
 split: val # (str) dataset split to use for validation, i.e. 'val', 'test' or 'train'

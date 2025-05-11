@@ -651,7 +651,7 @@ class BaseTrainer:
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
                         self.plot_training_samples(pseudo_batch, ni)
-                if i % 100 == 0:
+                if self.args.batch_len > 0 and i%self.args.batch_len == 0: 
                     LOGGER.info(
                         f"Train {epoch}/{self.epochs} "
                         f"Batch {i}/{len(self.train_loader)} "
