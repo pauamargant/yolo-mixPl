@@ -137,7 +137,6 @@ class BaseTrainer:
 
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
-        self.teacher_model = None
         self.ema = None
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.trainset, self.testset = self.get_dataset()
@@ -498,18 +497,6 @@ class BaseTrainer:
         if world_size > 1:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
-        # validate before training
-        if RANK in {-1, 0}:
-            LOGGER.info(f"Validating before training...")
-            self.metrics, self.fitness = self.validate()
-            if self.args.target_data:
-                LOGGER.info(f"Target domain validation...")
-                tgt_metrics, self.target_fitness = self.validate(target_data=True)
-                # prefix and merge
-                tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
-                self.metrics.update(tgt_metrics)
-            # save csv
-            self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 
 
         nb = len(self.train_loader)  # number of batches
@@ -604,7 +591,7 @@ class BaseTrainer:
                         # Get raw predictions from the teacher model (EMA weights)
                         # chec ktype of target_imgs
                         
-                        teacher_preds = self.teacher_model.ema(target_imgs)
+                        teacher_preds = self.ema.ema(target_imgs)
                     
                     pseudo_batch = self.build_pseudo_batch(
                         teacher_preds=teacher_preds,
@@ -682,7 +669,7 @@ class BaseTrainer:
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 final_epoch = epoch + 1 >= self.epochs
-                self.teacher_model.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
@@ -736,6 +723,7 @@ class BaseTrainer:
             seconds = time.time() - self.train_time_start
             LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
             self.final_eval()
+            # self.ema = ModelEMA(self.model, decay=self.args.ema_decay)  # EMA model
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
@@ -803,11 +791,11 @@ class BaseTrainer:
             {
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
-                "model": deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,  # resume and final checkpoints derive from EMA
-                "ema":  None,
+                "model": deepcopy(self.ema.ema).half() if self.ema.ema else None,  # resume and final checkpoints derive from EMA
+                "ema":  deepcopy(self.ema.ema).half() if self.ema else None,
                 # "teacher_model": deepcopy(self.teacher_model.ema).half() if self.teacher_model else None,
                 # "teacher_updates": self.teacher_model.updates  if self.teacher_model else None,
-                "updates": self.teacher_model.updates,
+                "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "train_args": vars(self.args),  # save as dict
                 "train_metrics": {**self.metrics, **{"fitness": self.target_fitness}},
@@ -898,9 +886,9 @@ class BaseTrainer:
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
             if self.args.teacher_model: 
-                self.teacher_model = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
-                self.teacher_model.ema=self.teacher_model.ema.to(self.device)
-                self.teacher_model.ema.eval()
+                self.ema = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
+                self.ema.ema=self.ema.ema.to(self.device)
+                self.ema.ema.eval()
 
             return
 
@@ -913,9 +901,9 @@ class BaseTrainer:
             weights, _ = attempt_load_one_weight(self.args.pretrained)
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         if self.args.teacher_model:
-            self.teacher_model = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
-            self.teacher_model.ema=self.teacher_model.ema.to(self.device)
-            self.teacher_model.ema.eval()
+            self.ema = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
+            self.ema.ema=self.ema.ema.to(self.device)
+            self.ema.ema.eval()
 
         return ckpt
 
@@ -926,8 +914,8 @@ class BaseTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
-        if self.teacher_model:
-            self.teacher_model.update(self.model)
+        if self.ema:
+            self.ema.update(self.model)
 
     def preprocess_batch(self, batch):
         """Allows custom preprocessing model inputs and ground truths depending on task type."""
@@ -940,9 +928,9 @@ class BaseTrainer:
         Returns:
             (tuple): A tuple containing metrics dictionary and fitness score.
         """
-        if self.teacher_model:
+        if self.ema:
             student=self.model
-            self.model = self.teacher_model.ema
+            self.model = self.ema.ema
         if target_data:
             metrics = self.target_validator(self)
         else:
@@ -952,7 +940,7 @@ class BaseTrainer:
             self.best_fitness = fitness
         if target_data and (not self.best_target_fitness or self.best_target_fitness < fitness):
             self.best_target_fitness = fitness
-        if self.teacher_model:
+        if self.ema:
             self.model = student
         return metrics, fitness
 
@@ -1077,6 +1065,9 @@ class BaseTrainer:
         if ckpt.get("optimizer", None) is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])  # optimizer
             best_fitness = ckpt["best_fitness"]
+        if self.ema and ckpt.get("ema"):
+            self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())  # EMA
+            self.ema.updates = ckpt["updates"]
         assert start_epoch > 0, (
             f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
             f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
