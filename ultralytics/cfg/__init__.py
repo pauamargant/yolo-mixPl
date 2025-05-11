@@ -849,7 +849,6 @@ def entrypoint(debug: str = "") -> None:
         - For a list of all available commands and their arguments, see the provided help messages and the
           Ultralytics documentation at https://docs.ultralytics.com.
     """
-    print("ENTERING HERE")
     args = (debug.split(" ") if debug else ARGV)[1:]
     if not args:  # no arguments passed
         LOGGER.info(CLI_HELP_MSG)
@@ -1027,6 +1026,5 @@ def copy_default_cfg() -> None:
 
 
 if __name__ == "__main__":
-    print("Ultralytics CLI entrypoint")
     # Example: entrypoint(debug='yolo predict model=yolo11n.pt')
     entrypoint(debug="")
