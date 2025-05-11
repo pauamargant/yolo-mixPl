@@ -610,9 +610,9 @@ class BaseTrainer:
                     self.u_tloss = torch.zeros(3, device=self.device) # Initialize unsupervised loss items
                     self.u_loss_items = torch.zeros(3, device=self.device) # Initialize unsupervised loss items
                 # Combine supervised and unsupervised loss
-                self.loss = self.s_loss + self.args.loss_mix_ratio * self.u_loss
+                self.loss = self.args.s_lambda*self.s_loss + self.args.u_lambda * self.u_loss
                 # sum loss items
-                self.loss_items = self.s_loss_items + self.args.loss_mix_ratio * self.u_loss_items
+                self.loss_items = self.args.s_lambda*self.s_loss_items + self.args.u_lambda * self.u_loss_items
                 self.tloss = (
                     (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                 )                    
@@ -651,7 +651,17 @@ class BaseTrainer:
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
                         self.plot_training_samples(pseudo_batch, ni)
-                        
+                if i % 100 == 0:
+                    LOGGER.info(
+                        f"Train {epoch}/{self.epochs} "
+                        f"Batch {i}/{len(self.train_loader)} "
+                        f"Loss: {self.loss:.4f} "
+                        f"Supervised Loss: {self.s_loss:.4f} "
+                        f"Unsupervised Loss: {self.u_loss:.4f} "
+                        f"Memory: {self._get_memory():.3g}G"
+                    )
+                    break
+
 
                 self.run_callbacks("on_train_batch_end")
 
@@ -684,7 +694,7 @@ class BaseTrainer:
                 if self.args.save or final_epoch:
                     self.save_model()
                     self.run_callbacks("on_model_save")
-
+                    
             # Scheduler
             t = time.time()
             self.epoch_time = t - self.epoch_time_start
