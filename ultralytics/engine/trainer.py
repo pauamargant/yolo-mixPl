@@ -555,7 +555,7 @@ class BaseTrainer:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
                 # Forward
-                if self.args.loss_mix_ratio<1:
+                if self.args.s_lambda>0:
                     with autocast(self.amp):
                         batch = self.preprocess_batch(batch)
                         loss, self.s_loss_items = self.model(batch)
@@ -572,7 +572,7 @@ class BaseTrainer:
 
                     
                 # Pseudolableing target domain 
-                if self.target_train_loader:
+                if self.target_train_loader and self.args.u_lambda>0:
                     try:
                         # Get the next batch from the target dataset iterator
                         target_batch = next(target_iterator)

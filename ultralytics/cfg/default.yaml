@@ -49,7 +49,8 @@ teacher_ema_decay: 0.9998 # (float) EMA decay for teacher model
 pseudolabel_conf: 0.5
 nms_iou: 0.2
 teacher_model: True
-loss_mix_ratio: 0.5 # (float) loss mix ratio for teacher model
+s_lambda: 1 # (float) loss mix ratio for teacher model
+u_lambda: 1 # (float) loss mix ratio for student model
 save_student: False
 
 
