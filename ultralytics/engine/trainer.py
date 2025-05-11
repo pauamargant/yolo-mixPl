@@ -587,9 +587,7 @@ class BaseTrainer:
                     target_batch = self.preprocess_batch(target_batch)
                     target_imgs = target_batch["img"].to(self.device)
 
-                    with torch.no_grad(): # Disable gradients for teacher inference
-                        # Get raw predictions from the teacher model (EMA weights)
-                        # chec ktype of target_imgs
+                    with torch.no_grad():
                         
                         teacher_preds = self.ema.ema(target_imgs)
                     
@@ -605,6 +603,8 @@ class BaseTrainer:
                         self.u_tloss = (
                             (self.u_tloss * i + self.u_loss_items) / (i + 1) if self.u_tloss is not None else self.u_loss_items
                         )
+                        if RANK != -1:
+                            self.u_loss *= world_size
                 else:
                     self.u_loss = torch.tensor(0.0, device=self.device) # Initialize unsupervised loss
                     self.u_tloss = torch.zeros(3, device=self.device) # Initialize unsupervised loss items
@@ -645,6 +645,8 @@ class BaseTrainer:
                             *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
                             batch["cls"].shape[0],  # batch size, i.e. 8
                             batch["img"].shape[-1],  # imgsz, i.e 640
+                            *(self.u_tloss if loss_length > 1 else torch.unsqueeze(self.u_tloss, 0)),
+                            *(self.s_tloss if loss_length > 1 else torch.unsqueeze(self.s_tloss, 0)),  # supervised loss
                         )
                     )
                     self.run_callbacks("on_batch_end")
