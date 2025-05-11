@@ -588,7 +588,6 @@ class BaseTrainer:
                     target_imgs = target_batch["img"].to(self.device)
 
                     with torch.no_grad():
-                        
                         teacher_preds = self.ema.ema(target_imgs)
                     
                     pseudo_batch = self.build_pseudo_batch(
@@ -915,9 +914,9 @@ class BaseTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
-        if self.ema:
-            self.ema.update(self.model)
-            self.model.train()
+        # if self.ema:
+        #     self.ema.update(self.model)
+        #     self.model.train()
 
     def preprocess_batch(self, batch):
         """Allows custom preprocessing model inputs and ground truths depending on task type."""
