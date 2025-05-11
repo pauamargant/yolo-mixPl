@@ -498,6 +498,19 @@ class BaseTrainer:
         if world_size > 1:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
+        # validate before training
+        if RANK in {-1, 0}:
+            LOGGER.info(f"Validating before training...")
+            self.metrics, self.fitness = self.validate()
+            if self.args.target_data:
+                LOGGER.info(f"Target domain validation...")
+                tgt_metrics, self.target_fitness = self.validate(target_data=True)
+                # prefix and merge
+                tgt_metrics = {f"tgt/{k}": v for k, v in tgt_metrics.items()}
+                self.metrics.update(tgt_metrics)
+            # save csv
+            self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                
 
         nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
