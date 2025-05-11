@@ -352,7 +352,7 @@ class BaseTrainer:
         device='cpu'
         ):
         """
-        Convert teacher model predictions into a pseudo-labeled, augmented batch dict.
+        Convert teacher model predictions into a pseuflabeled, augmented batch dict.
 
         Returns:
             dict with keys:
@@ -888,7 +888,7 @@ class BaseTrainer:
             if self.args.teacher_model: 
                 self.ema = ModelEMA(self.model,decay = self.args.teacher_ema_decay, tau=1)
                 self.ema.ema=self.ema.ema.to(self.device)
-                self.ema.ema.eval()
+                # self.ema.ema.eval()
 
             return
 
@@ -903,7 +903,7 @@ class BaseTrainer:
         if self.args.teacher_model:
             self.ema = ModelEMA(self.model,decay = self.args.teacher_ema_decay)
             self.ema.ema=self.ema.ema.to(self.device)
-            self.ema.ema.eval()
+            # self.ema.ema.eval()
 
         return ckpt
 
