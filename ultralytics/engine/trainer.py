@@ -500,18 +500,18 @@ class BaseTrainer:
             )
             # filter annotations with 0 area
             # Remove boxes with zero area or with x/y out of bounds (within 1e-7)
-            filtered = [
-                (box, lbl)
-                for box, lbl in zip(augmented['bboxes'], augmented['labels'])
-                if box[2] > 0 and box[3] > 0
-                and 1e-6 < box[0] < 1 - 1e-6
-                and 1e-6 < box[1] < 1 - 1e-6
-            ]
-            if filtered:
-                augmented['bboxes'], augmented['labels'] = zip(*filtered)
-                augmented['bboxes'], augmented['labels'] = list(augmented['bboxes']), list(augmented['labels'])
-            else:
-                augmented['bboxes'], augmented['labels'] = [], []
+            # filtered = [
+            #     (box, lbl)
+            #     for box, lbl in zip(augmented['bboxes'], augmented['labels'])
+            #     if box[2] > 0 and box[3] > 0
+            #     and 1e-6 < box[0] < 1 - 1e-6
+            #     and 1e-6 < box[1] < 1 - 1e-6
+            # ]
+            # if filtered:
+            #     augmented['bboxes'], augmented['labels'] = zip(*filtered)
+            #     augmented['bboxes '], augmented['labels'] = list(augmented['bboxes']), list(augmented['labels'])
+            # else:
+            #     augmented['bboxes'], augmented['labels'] = [], []
 
             augmented = strong_transform_aug(
                 image=augmented['image'],
