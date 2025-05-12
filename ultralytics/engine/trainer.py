@@ -404,10 +404,44 @@ class BaseTrainer:
                     ],
                     p=1.0,
                 ),
-
-                # (optionally uncomment for random erasing)
-                # A.CoarseDropout(max_holes=5, max_height=int(0.2*img_h),
-                #                 max_width=int(0.2*img_w), p=0.5),
+                # blur & noise ops
+                A.OneOf(
+                    [
+                        A.MotionBlur(p=0.5),
+                        A.GaussianBlur(blur_limit=(3,7), p=0.5),
+                        A.MedianBlur(blur_limit=3, p=0.5),
+                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+                        A.ISONoise(color_shift=(0.01,0.05), intensity=(0.1,0.5), p=0.5),
+                    ],
+                    p=0.5,
+                ),
+                # distortion ops
+                A.OneOf(
+                    [
+                        A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=0.5),
+                        A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.5),
+                        A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+                        A.Perspective(scale=(0.05,0.1), p=0.5),
+                    ],
+                    p=0.5,
+                ),
+                # channel shuffle & gamma
+                A.OneOf(
+                    [
+                        A.ChannelShuffle(p=0.5),
+                        A.RandomGamma(gamma_limit=(80,120), p=0.5),
+                    ],
+                    p=0.5,
+                ),
+                # weather/artifact effects
+                A.OneOf(
+                    [
+                        A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=0.3),
+                        A.RandomRain(slant_lower=-10, slant_upper=10, p=0.3),
+                        A.RandomSnow(snow_point_lower=0.1, snow_point_upper=0.3, p=0.3),
+                    ],
+                    p=0.5,
+                ),
             ],
             bbox_params=A.BboxParams(
                 format='yolo',            # normalized xywh
