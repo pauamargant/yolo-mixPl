@@ -391,6 +391,7 @@ class BaseTrainer:
                         A.HueSaturationValue(p=1.0),      # ColorTransform
                     ],
                     p=1.0,
+                    # readd 
                 ),
             ],
             bbox_params=A.BboxParams(
@@ -446,7 +447,7 @@ class BaseTrainer:
                 format='yolo',            # normalized xywh
                 label_fields=['labels'],
                 filter_invalid_bboxes=True,
-                check_each_transform=False   # clamp only at the end
+                check_each_transform=True   # clamp only at the end
             )
         )
 
