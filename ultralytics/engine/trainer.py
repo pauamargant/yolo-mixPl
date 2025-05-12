@@ -393,6 +393,17 @@ class BaseTrainer:
                     p=1.0,
                     # readd 
                 ),
+                # one random geometric op
+                A.OneOf(
+                    [
+                        A.Rotate(limit=15, p=1.0),                     # Rotate
+                        A.Affine(shear={'x':(-20,20)}, p=1.0),         # ShearX
+                        A.Affine(shear={'y':(-20,20)}, p=1.0),         # ShearY
+                        A.Affine(translate_percent={'x':(-0.1,0.1)}, p=1.0),  # TranslateX
+                        A.Affine(translate_percent={'y':(-0.1,0.1)}, p=1.0),  # TranslateY
+                    ],
+                    p=1.0,
+                )
             ],
             bbox_params=A.BboxParams(
                 format='yolo',            # normalized xywh
