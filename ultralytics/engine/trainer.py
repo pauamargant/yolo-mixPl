@@ -397,10 +397,7 @@ class BaseTrainer:
                 A.OneOf(
                     [
                         A.Rotate(limit=15, p=1.0),                     # Rotate
-                        A.Affine(shear={'x':(-20,20)}, p=1.0),         # ShearX
-                        A.Affine(shear={'y':(-20,20)}, p=1.0),         # ShearY
-                        A.Affine(translate_percent={'x':(-0.1,0.1)}, p=1.0),  # TranslateX
-                        A.Affine(translate_percent={'y':(-0.1,0.1)}, p=1.0),  # TranslateY
+                        A.Affine(p=1.0),         
                     ],
                     p=1.0,
                 )
@@ -421,7 +418,7 @@ class BaseTrainer:
                         A.MotionBlur(p=0.5),
                         A.GaussianBlur(blur_limit=(3,7), p=0.5),
                         A.MedianBlur(blur_limit=3, p=0.5),
-                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+                        A.GaussNoise(p=0.5),
                         A.ISONoise(color_shift=(0.01,0.05), intensity=(0.1,0.5), p=0.5),
                     ],
                     p=0.5,
@@ -429,9 +426,9 @@ class BaseTrainer:
                 # distortion ops
                 A.OneOf(
                     [
-                        A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=0.5),
+                        A.OpticalDistortion(distort_limit=(-0.05,0.05), mode='camera', p=0.5),
                         A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.5),
-                        A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+                        A.ElasticTransform(p=0.5),
                         A.Perspective(scale=(0.05,0.1), p=0.5),
                     ],
                     p=0.5,
@@ -447,9 +444,9 @@ class BaseTrainer:
                 # weather/artifact effects
                 A.OneOf(
                     [
-                        A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=0.3),
-                        A.RandomRain(slant_lower=-10, slant_upper=10, p=0.3),
-                        A.RandomSnow(snow_point_lower=0.1, snow_point_upper=0.3, p=0.3),
+                        A.RandomFog(p=0.3),
+                        A.RandomRain(p=0.3),
+                        A.RandomSnow(p=0.3),
                     ],
                     p=0.5,
                 )
@@ -498,6 +495,7 @@ class BaseTrainer:
                 bboxes=bboxes_list,
                 labels=labels_list
             )
+
             augmented = strong_transform_aug(
                 image=augmented['image'],
                 bboxes=augmented['bboxes'],
