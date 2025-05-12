@@ -392,15 +392,6 @@ class BaseTrainer:
                     ],
                     p=1.0,
                 ),
-
-                # one random geometric op
-                A.OneOf(
-                    [
-                        A.Rotate(limit=15, p=1.0),                     # Rotate
-                        A.Affine(p=1.0),         
-                    ],
-                    p=1.0,
-                )
             ],
             bbox_params=A.BboxParams(
                 format='yolo',            # normalized xywh
