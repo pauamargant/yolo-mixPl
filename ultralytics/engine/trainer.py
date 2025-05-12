@@ -486,6 +486,11 @@ class BaseTrainer:
                 bboxes=bboxes_list,
                 labels=labels_list
             )
+            # filter annotations with 0 area
+            for i, box in enumerate(augmented['bboxes']):
+                if box[2] <= 0 or box[3] <= 0:
+                    augmented['bboxes'].pop(i)
+                    augmented['labels'].pop(i)
 
             augmented = strong_transform_aug(
                 image=augmented['image'],
