@@ -373,7 +373,7 @@ class BaseTrainer:
         bs, _, img_h, img_w = target_imgs.shape
 
         # 2) Build an Albumentations Compose matching your strong_pipeline
-        strong_transform = A.Compose(
+        strong_transform_basic = A.Compose(
             [
                 # # — weak parts are already handled upstream, so we just ensure the same resize+flip —
                 # A.Resize(img_h, img_w, interpolation=1),  # like RandomResize
@@ -403,8 +403,19 @@ class BaseTrainer:
                         A.Affine(translate_percent={'y':(-0.1,0.1)}, p=1.0),  # TranslateY
                     ],
                     p=1.0,
-                ),
-                # blur & noise ops
+                )
+            ],
+            bbox_params=A.BboxParams(
+                format='yolo',            # normalized xywh
+                label_fields=['labels'],
+                filter_invalid_bboxes=True,
+                check_each_transform=False   # clamp only at the end
+
+            )
+        )
+        strong_transform_aug = A.Compose(
+            [
+            # blur & noise ops
                 A.OneOf(
                     [
                         A.MotionBlur(p=0.5),
@@ -441,16 +452,17 @@ class BaseTrainer:
                         A.RandomSnow(snow_point_lower=0.1, snow_point_upper=0.3, p=0.3),
                     ],
                     p=0.5,
-                ),
+                )
             ],
             bbox_params=A.BboxParams(
                 format='yolo',            # normalized xywh
                 label_fields=['labels'],
                 filter_invalid_bboxes=True,
                 check_each_transform=False   # clamp only at the end
-
             )
         )
+
+            
 
         images_aug = []
         batch_idxs, classes, bboxes = [], [], []
@@ -472,6 +484,7 @@ class BaseTrainer:
                     xywh[:, 2] /= img_w; xywh[:, 3] /= img_h
                     bboxes_list = [tuple(x.tolist()) for x in xywh]
                     labels_list = det[:, 5].long().tolist()
+                    
 
             # --- prepare image for Albumentations (HWC uint8) ---
             img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
@@ -480,10 +493,15 @@ class BaseTrainer:
                 img_np = (img_np * 255).round().astype(np.uint8)
 
             # --- apply the strong pipeline ---
-            augmented = strong_transform(
+            augmented = strong_transform_basic(
                 image=img_np,
                 bboxes=bboxes_list,
                 labels=labels_list
+            )
+            augmented = strong_transform_aug(
+                image=augmented['image'],
+                bboxes=augmented['bboxes'],
+                labels=augmented['labels']
             )
 
             # --- collect augmented image ---
