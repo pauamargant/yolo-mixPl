@@ -418,13 +418,13 @@ class BaseTrainer:
             # blur & noise ops
                 A.OneOf(
                     [
-                        A.MotionBlur(p=0.5),
+                        # A.MotionBlur(p=0.5),
                         A.GaussianBlur(blur_limit=(3,7), p=0.5),
                         A.MedianBlur(blur_limit=3, p=0.5),
                         A.GaussNoise(p=0.5),
                         A.ISONoise(color_shift=(0.01,0.05), intensity=(0.1,0.5), p=0.5),
                     ],
-                    p=0.5,
+                    p=0.75,
                 ),
                 # distortion ops
                 A.OneOf(
@@ -434,25 +434,18 @@ class BaseTrainer:
                         A.ElasticTransform(p=0.5),
                         A.Perspective(scale=(0.05,0.1), p=0.5),
                     ],
-                    p=0.5,
+                    p=0.75,
                 ),
                 # channel shuffle & gamma
                 A.OneOf(
                     [
                         A.ChannelShuffle(p=0.5),
                         A.RandomGamma(gamma_limit=(80,120), p=0.5),
+                        A.HueSaturationValue(p=0.5),
                     ],
-                    p=0.5,
+                    p=0.75,
                 ),
-                # weather/artifact effects
-                A.OneOf(
-                    [
-                        A.RandomFog(p=0.3),
-                        A.RandomRain(p=0.3),
-                        A.RandomSnow(p=0.3),
-                    ],
-                    p=0.5,
-                )
+               
             ],
             bbox_params=A.BboxParams(
                 format='yolo',            # normalized xywh
