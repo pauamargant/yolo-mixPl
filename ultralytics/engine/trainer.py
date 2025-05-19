@@ -459,7 +459,6 @@ class BaseTrainer:
 
         images_aug = []
         batch_idxs, classes, bboxes = [], [], []
-
         # 3) Loop per-image: filter pseudo-labels, then augment
         for batch_idx, (img_tensor, det) in enumerate(zip(target_imgs, results)):
             # --- filter pseudo-labels as before ---
@@ -477,8 +476,6 @@ class BaseTrainer:
                     xywh[:, 2] /= img_w; xywh[:, 3] /= img_h
                     bboxes_list = [tuple(x.tolist()) for x in xywh]
                     labels_list = det[:, 5].long().tolist()
-                    
-
             # --- prepare image for Albumentations (HWC uint8) ---
             img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
             # if your imgs are floats [0,1]:
@@ -529,7 +526,12 @@ class BaseTrainer:
                 batch_idxs.append(batch_idx)
                 classes.append(lbl)
                 bboxes.append(box)
-
+            # from utils.plotting import plot_images
+            # plot_images(
+            #     images = images_aug,
+                
+            # )
+            break
         # 4) stack everything and return
         if images_aug:
             imgs_tensor = torch.cat(images_aug, dim=0)  # [B, C, H, W]
@@ -545,7 +547,6 @@ class BaseTrainer:
             batch_idx_tensor = torch.zeros((0,), dtype=torch.long, device=device)
             cls_tensor       = torch.zeros((0,), dtype=torch.long, device=device)
             bboxes_tensor    = torch.zeros((0, 4), dtype=torch.float, device=device)
-
         return {
             'img':       imgs_tensor,
             'batch_idx': batch_idx_tensor,
@@ -974,7 +975,7 @@ class BaseTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
-        if self.ema:
+        if self.args.teacher_model:
             self.ema.update(self.model)
 
     def preprocess_batch(self, batch):
@@ -988,9 +989,9 @@ class BaseTrainer:
         Returns:
             (tuple): A tuple containing metrics dictionary and fitness score.
         """
-        # if self.ema:
-        #     student=self.model
-        #     self.model = self.ema.ema
+        if self.ema:
+            student=self.model
+            self.model = self.ema.ema
         if target_data:
             metrics = self.target_validator(self)
         else:
@@ -1000,8 +1001,8 @@ class BaseTrainer:
             self.best_fitness = fitness
         if target_data and (not self.best_target_fitness or self.best_target_fitness < fitness):
             self.best_target_fitness = fitness
-        # if self.ema:
-        #     self.model = student
+        if self.ema:
+            self.model = student
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
