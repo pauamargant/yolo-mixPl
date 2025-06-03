@@ -651,8 +651,15 @@ def ap_per_class(
         plot_mc_curve(x, f1_curve, save_dir / f"{prefix}F1_curve.png", names, ylabel="F1", on_plot=on_plot)
         plot_mc_curve(x, p_curve, save_dir / f"{prefix}P_curve.png", names, ylabel="Precision", on_plot=on_plot)
         plot_mc_curve(x, r_curve, save_dir / f"{prefix}R_curve.png", names, ylabel="Recall", on_plot=on_plot)
-
-    i = smooth(f1_curve.mean(0), 0.1).argmax()  # max F1 index
+    if len(unique_classes) >2:  # no classes
+        exclude_index = 2
+        f1_curve_masked = np.delete(f1_curve, exclude_index, axis=0)  # remove class at index 2
+    else:
+        f1_curve_masked = f1_curve
+    i = smooth(f1_curve_masked.mean(0), 0.1).argmax()   
+    print(i)
+    LOGGER.info("---------------------")
+    LOGGER.info(i)
     p, r, f1 = p_curve[:, i], r_curve[:, i], f1_curve[:, i]  # max-F1 precision, recall, F1 values
     tp = (r * nt).round()  # true positives
     fp = (tp / (p + eps) - tp).round()  # false positives
